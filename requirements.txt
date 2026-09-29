@@ -1,4 +1,4 @@
-mcp>=1.0.0
+mcp>=1.0.0,<2   # v2 renamed FastMCP -> MCPServer; server.py uses the v1 API
 requests>=2.31
 websocket-client>=1.7
 # MT5 server + signal bridge only (Windows-only package):
