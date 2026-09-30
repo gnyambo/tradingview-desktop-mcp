@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-MCP server for TradingView Desktop (Windows).
+MCP server for TradingView Desktop (Windows; also runs on Linux when TradingView
+is started separately with the CDP port, e.g. as a systemd service).
 
 TradingView Desktop is an Electron app, so it can be controlled through the
 Chrome DevTools Protocol (CDP). This server connects to the chart page and
@@ -9,7 +10,7 @@ as MCP tools: screenshots, symbol/timeframe control, indicators, the Pine
 Editor, the Strategy Tester, and a raw JS escape hatch.
 
 The app must be launched with --remote-debugging-port (the tv_launch tool
-does this automatically).
+does this automatically on Windows).
 
 Environment variables:
   TV_CDP_PORT   CDP debugging port (default: 9222)
@@ -156,8 +157,11 @@ class CDPClient:
             raise CDPError(f"JS exception: {desc[:500]}")
         return result.get("result", {}).get("value")
 
-    def screenshot_png(self) -> bytes:
-        resp = self._send("Page.captureScreenshot", {"format": "png"})
+    def screenshot_png(self, clip: dict | None = None) -> bytes:
+        params: dict = {"format": "png"}
+        if clip:
+            params["clip"] = clip
+        resp = self._send("Page.captureScreenshot", params)
         if "error" in resp:
             raise CDPError(f"CDP error: {resp['error']}")
         return b64decode(resp["result"]["data"])
@@ -225,12 +229,62 @@ def tv_launch(wait_seconds: int = 25) -> str:
 
 @mcp.tool()
 def tv_screenshot() -> list:
-    """Capture the current TradingView chart. Returns the PNG image plus the path
-    of a copy saved to the temp dir (for clients that don't render MCP images)."""
+    """Capture the whole TradingView window (toolbars included). For chart analysis
+    prefer tv_screenshot_chart. Returns the PNG image plus the
+    path of a copy saved to the temp dir (for clients that don't render MCP images)."""
     png = client.screenshot_png()
     path = Path(tempfile.gettempdir()) / f"tv_screenshot_{int(time.time())}.png"
     path.write_bytes(png)
     return [Image(data=png, format="png"), _ok({"saved_to": str(path)})]
+
+
+def _close_popups() -> int:
+    return client.eval("""
+(() => {
+  let n = 0;
+  for (const d of document.querySelectorAll('[data-dialog-name], [role="dialog"]')) {
+    const b = Array.from(d.querySelectorAll('button')).find(
+      x => /cierre|close|cerrar/i.test(x.getAttribute('aria-label') || x.textContent || ''));
+    if (b) { b.click(); n++; }
+  }
+  return n;
+})()
+""")
+
+
+def _reset_view() -> dict:
+    client.eval("TradingViewApi.activeChart().executeActionById('chartReset')")
+    closed = _close_popups()
+    time.sleep(0.5)
+    return {"reset": True, "popups_closed": closed}
+
+
+@mcp.tool()
+def tv_reset_view() -> str:
+    """Reset the chart view (TradingView's 'Reset chart': default zoom, autoscaled
+    price axis) and close popups. Fixes a price scale left over from another
+    timeframe. tv_screenshot_chart does this automatically."""
+    return _ok(_reset_view())
+
+
+@mcp.tool()
+def tv_screenshot_chart(scale: float = 1.5) -> list:
+    """Screenshot of the chart area only (no toolbars/sidebars). Resets the view first
+    (see tv_reset_view). scale>1 renders the crop at higher resolution for readability."""
+    _reset_view()
+    box = client.eval("""(() => {
+      const el = document.querySelector('.chart-container')
+              || document.querySelector('.layout__area--center');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {x: r.x, y: r.y, width: r.width, height: r.height};
+    })()""")
+    clip = {**box, "scale": scale} if box else None
+    png = client.screenshot_png(clip)
+    path = Path(tempfile.gettempdir()) / f"tv_chart_{int(time.time())}.png"
+    path.write_bytes(png)
+    return [Image(data=png, format="png"),
+            _ok({"saved_to": str(path), "clipped": bool(box), "box": box})]
 
 
 @mcp.tool()
@@ -347,17 +401,7 @@ def tv_pine_add_to_chart(update_existing: bool = False) -> str:
 @mcp.tool()
 def tv_close_popups() -> str:
     """Close open TradingView dialogs/popups (e.g. 'gopro' plan-limit promos)."""
-    n = client.eval("""
-(() => {
-  let n = 0;
-  for (const d of document.querySelectorAll('[data-dialog-name], [role="dialog"]')) {
-    const b = Array.from(d.querySelectorAll('button')).find(
-      x => /cierre|close|cerrar/i.test(x.getAttribute('aria-label') || x.textContent || ''));
-    if (b) { b.click(); n++; }
-  }
-  return n;
-})()
-""")
+    n = _close_popups()
     return _ok({"closed": n})
 
 
