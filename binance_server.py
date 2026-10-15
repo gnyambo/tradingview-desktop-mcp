@@ -112,7 +112,8 @@ def binance_klines(symbol: str, interval: str = "15m", limit: int = 150) -> str:
 def binance_swings(symbol: str, interval: str = "15m", limit: int = 300,
                    strength: int = 3, keep: int = 8) -> str:
     """Exact recent swing highs/lows (fractal pivots) with HH/HL/LH/LL labels, plus
-    the range high/low and current price. Use these numbers for levels instead of
+    the range high/low, current price and atr14 (simple average of the last 14 true
+    ranges on closed candles). Use these numbers for levels instead of
     reading prices off a screenshot. strength = bars each side needed to confirm a
     swing (higher = fewer, more significant swings). This is a mechanical definition,
     not a full SMC structure read."""
@@ -121,10 +122,15 @@ def binance_swings(symbol: str, interval: str = "15m", limit: int = 300,
     highs, lows = _find_swings(bars, max(1, int(strength)))
     hi = max(bars, key=lambda b: b["h"])
     lo = min(bars, key=lambda b: b["l"])
+    closed = [b for b in bars if b["closed"]]
+    trs = [max(c["h"] - c["l"], abs(c["h"] - p["c"]), abs(c["l"] - p["c"]))
+           for p, c in zip(closed, closed[1:])]
+    atr14 = round(sum(trs[-14:]) / len(trs[-14:]), 8) if trs else None
     return _ok({
         "symbol": sym, "interval": iv, "tz": "UTC", "bars_scanned": len(bars),
         "from": _t(bars[0]["t"]), "to": _t(bars[-1]["t"]),
         "last_price": bars[-1]["c"],
+        "atr14": atr14,
         "range_high": {"time": _t(hi["t"]), "price": hi["h"]},
         "range_low": {"time": _t(lo["t"]), "price": lo["l"]},
         "swing_highs": highs[-keep:], "swing_lows": lows[-keep:],

@@ -86,7 +86,9 @@ args = ["C:/path/to/tradingview-desktop-mcp/mt5_server.py"]
 |---|---|
 | `tv_status` | App running? CDP connected? Current symbol/timeframe/layout |
 | `tv_launch` | Start TradingView with the CDP port (detects the no-port case) |
-| `tv_screenshot` | PNG of the chart (returned as image + saved file path) |
+| `tv_screenshot` | PNG of the whole window (returned as image + saved file path) |
+| `tv_screenshot_chart` | PNG of the chart area only; resets the view first |
+| `tv_reset_view` | Reset zoom and autoscale the price axis, then close popups |
 | `tv_get_chart` | Symbol, resolution, chart type, visible range, studies |
 | `tv_set_symbol` | Change symbol (`OANDA:XAUUSD`, `BINANCE:BTCUSDT`, `NASDAQ:AAPL`…) |
 | `tv_set_resolution` | Change timeframe (`1`, `5`, `15`, `60`, `240`, `1D`, `1W`…) |

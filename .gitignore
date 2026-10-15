@@ -3,3 +3,6 @@ __pycache__/
 bridge_trades.csv
 *.png
 .env
+.venv/
+*.backup
+*.tar.gz
