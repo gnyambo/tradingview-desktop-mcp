@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+"""
+Report: compares the /tv plans with the scanner's own levels on the same alerts,
+and breaks /tv results down by grade and by rubric criterion.
+Usage: python3 report.py [--since YYYY-MM-DD]
+"""
+import argparse
+import os
+from collections import defaultdict
+
+from common import FEE_ROUNDTRIP_PCT, NOTIONAL_USD, iter_plan_paths, load_json
+
+def stop_bucket(entry, sl, atr):
+    try:
+        m = abs(float(entry) - float(sl)) / float(atr)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return "stop < 1x ATR" if m < 1 else ("stop 1-2x ATR" if m <= 2 else "stop > 2x ATR")
+
+
+CRITERIA = ("d1_alignment", "h4_alignment", "location", "confirmation_15m", "rr_tp1", "stop_quality")
+
+
+def leg_r(leg: dict) -> float | None:
+    """R of a finished, entered trade (TP1 counts as the result even if TP2 came later)."""
+    if not leg or not leg.get("final") or leg.get("fill_price") is None:
+        return None
+    return leg.get("r")
+
+
+
+
+def leg_usd(leg: dict, sl) -> float | None:
+    """Dollar result of an entered, resolved leg at fixed notional, after fees.
+    price move % = r x stop distance % (r already carries the sign)."""
+    try:
+        fill, r = float(leg["fill_price"]), float(leg["r"])
+        stop_pct = abs(fill - float(sl)) / fill
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    return NOTIONAL_USD * (r * stop_pct - FEE_ROUNDTRIP_PCT / 100)
+
+
+class Bucket:
+    def __init__(self):
+        self.n = self.entered = self.wins = self.losses = self.timeouts = self.live = 0
+        self.not_entered = defaultdict(int)
+        self.rs = []
+        self.usd = []
+        self.risk_usd = []
+
+    def add(self, leg: dict | None, sl=None):
+        self.n += 1
+        if not leg:
+            self.live += 1
+            return
+        entered = leg.get("fill_price") is not None
+        if not leg.get("final") and not (entered and leg.get("result")):
+            self.live += 1  # still waiting, or open before TP1/SL
+            return
+        st = leg.get("state")
+        if not entered:
+            if st == "CANCELLED":  # split: right direction but missed, vs idea invalidated
+                st = "MISSED" if (leg.get("note") or "").startswith("TP1 reached") else "INVALIDATED"
+            self.not_entered[st] += 1
+            return
+        self.entered += 1
+        res = leg.get("result")
+        self.wins += res == "TP1"
+        self.losses += res == "LOSS"
+        self.timeouts += res == "TIMEOUT"
+        if leg.get("r") is not None:
+            self.rs.append(leg["r"])
+            sl = sl if sl is not None else (leg.get("levels") or {}).get("sl")
+            usd = leg_usd(leg, sl) if sl is not None else None
+            if usd is not None:
+                self.usd.append(usd)
+                try:
+                    self.risk_usd.append(NOTIONAL_USD * abs(float(leg["fill_price"]) - float(sl))
+                                         / float(leg["fill_price"]))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+    def line(self, label: str) -> str:
+        done = self.entered
+        wr = f"{100 * self.wins / done:.0f}%" if done else "-"
+        avg = f"{sum(self.rs) / len(self.rs):+.2f}R" if self.rs else "-"
+        tot = f"{sum(self.rs):+.1f}R" if self.rs else "-"
+        ne = ", ".join(f"{k.lower()} {v}" for k, v in sorted(self.not_entered.items())) or "-"
+        usd = (f"${sum(self.usd):+.0f} (avg ${sum(self.usd) / len(self.usd):+.1f})") if self.usd else "-"
+        risk = f"${sum(self.risk_usd) / len(self.risk_usd):.0f}" if self.risk_usd else "-"
+        return (f"{label:<20} plans {self.n:>3} | live {self.live:>2} | entered {done:>3} | "
+                f"TP1 {self.wins:>3} SL {self.losses:>3} TO {self.timeouts:>2} | win {wr:>4} | "
+                f"avg {avg:>7} | total {tot:>7} | {usd:>18} | risk/trade {risk:>4} | not entered: {ne}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since", help="only plans created on/after this UTC date")
+    a = ap.parse_args()
+
+    plans = []
+    for p in iter_plan_paths():
+        pl = load_json(p)
+        if a.since and (pl.get("created_at_utc") or "") < a.since:
+            continue
+        plans.append(pl)
+    if not plans:
+        print("no plans yet")
+        return
+
+    tv_all, sc_all, tv_mkt = Bucket(), Bucket(), Bucket()
+    rule_all, rule_tv = Bucket(), Bucket()
+    sc_where_tv = Bucket()  # scanner leg only on alerts where /tv also produced a plan
+    by_grade, by_conflict = defaultdict(Bucket), defaultdict(Bucket)
+    by_crit = {c: defaultdict(Bucket) for c in CRITERIA}
+    sc_by_stop, tv_by_stop = defaultdict(Bucket), defaultdict(Bucket)
+    failed = capped = 0
+    cost = 0.0
+    for pl in plans:
+        legs = pl.get("legs", {})
+        sp = pl.get("scanner_plan") or {}
+        sc_all.add(legs.get("scanner"), sp.get("sl"))
+        rule_all.add(legs.get("rule_atr"))
+        run = pl.get("run", {})
+        cost += run.get("cost_usd") or 0
+        if run.get("skipped"):
+            capped += 1
+        tv = pl.get("tv")
+        if not tv:
+            failed += bool(run.get("ran"))
+            continue
+        tsl = tv.get("sl")
+        tv_all.add(legs.get("tv"), tsl)
+        tv_mkt.add(legs.get("tv_market"), tsl)
+        rule_tv.add(legs.get("rule_atr"))
+        sc_where_tv.add(legs.get("scanner"), sp.get("sl"))
+        by_grade[tv.get("grade", "?")].add(legs.get("tv"), tsl)
+        by_conflict["4h against" if tv.get("htf_conflict") else "4h not against"].add(legs.get("tv"), tsl)
+        for c in CRITERIA:
+            by_crit[c][(tv.get("criteria") or {}).get(c, "?")].add(legs.get("tv"), tsl)
+        atr = tv.get("atr15m")  # 15m ATR measured by /tv at the same moment
+        b = stop_bucket(sp.get("entry"), sp.get("sl"), atr)
+        if b:
+            sc_by_stop[b].add(legs.get("scanner"), sp.get("sl"))
+        tv_entry = (tv.get("entry") or {}).get("price") or (tv.get("trigger") or {}).get("price")
+        b = stop_bucket(tv_entry, tv.get("sl"), atr)
+        if b:
+            tv_by_stop[b].add(legs.get("tv"), tsl)
+
+    print(f"Alerts: {len(plans)}  | /tv failed: {failed} | skipped by cap: {capped} | "
+          f"est. Claude cost: ${cost:.2f}\n")
+    print("== /tv vs scanner (same alerts) ==")
+    print(tv_all.line("/tv"))
+    print(tv_mkt.line("/tv @ market"))
+    print(rule_tv.line("rule @ market"))
+    print(sc_where_tv.line("scanner"))
+    print(sc_all.line("scanner (all)"))
+    print(rule_all.line("rule (all)"))
+    print("\n== /tv by grade ==")
+    for g in sorted(by_grade):
+        print(by_grade[g].line(f"grade {g}"))
+    print("\n== /tv by 4h conflict ==")
+    for k in sorted(by_conflict):
+        print(by_conflict[k].line(k))
+    print("\n== stop distance in 15m ATR (ATR from the /tv run at alert time) ==")
+    for k in sorted(sc_by_stop):
+        print(sc_by_stop[k].line(f"scanner {k[5:]}"))
+    for k in sorted(tv_by_stop):
+        print(tv_by_stop[k].line(f"/tv {k[5:]}"))
+    print("\n== /tv by rubric criterion (score 0/1/2) ==")
+    for c in CRITERIA:
+        for score in sorted(by_crit[c], key=str):
+            print(by_crit[c][score].line(f"{c}={score}"))
+    print("\n/tv @ market = what-if: entered at market when the plan was issued, same SL/TP as /tv.")
+    print("rule @ market = no Claude: market entry in the scanner's direction, SL 1.5x ATR, TP1 1R, TP2 2R "
+          "(compare avg R, not win rate: the targets differ).")
+    print(f"$ = your sizing: ${NOTIONAL_USD:.0f} notional per trade (margin x leverage), "
+          f"minus ~{FEE_ROUNDTRIP_PCT}% round-trip fees. Funding not included. "
+          "risk/trade = average $ lost if a trade hits its stop.")
+    print("not entered: missed = TP1 reached before entry (direction right, entry too far); "
+          "invalidated = cancel level hit first; stale_levels = already past TP1 when issued.")
+    print("win = TP1 before SL, among entered trades. R uses TP1 as the result "
+          "(a trade that hit TP1 counts even while TP2 is still open). "
+          "Small samples: treat differences under ~30 trades per row as noise.")
+
+
+if __name__ == "__main__":
+    main()

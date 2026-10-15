@@ -1,0 +1,19 @@
+[Unit]
+Description=tv-worker: run /tv on new MTF-qualified scanner setups
+After=network-online.target
+Wants=network-online.target
+# never give up restarting after repeated crashes
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+Environment=HOME=/root
+EnvironmentFile=/etc/tv-pipeline.env
+WorkingDirectory=/root/tradingview-desktop-mcp/pipeline
+ExecStart=/usr/bin/python3 -u /root/tradingview-desktop-mcp/pipeline/tv_worker.py
+Restart=always
+RestartSec=30
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

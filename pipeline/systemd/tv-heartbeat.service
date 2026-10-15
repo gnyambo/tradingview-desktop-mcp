@@ -1,0 +1,9 @@
+[Unit]
+Description=tv-heartbeat: daily health message for the /tv pipeline
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/tv-pipeline.env
+WorkingDirectory=/root/tradingview-desktop-mcp/pipeline
+ExecStart=/usr/bin/python3 /root/tradingview-desktop-mcp/pipeline/heartbeat.py

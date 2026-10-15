@@ -1,0 +1,9 @@
+[Unit]
+Description=tv-resolver: update /tv and scanner plan outcomes from 15m candles
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/tv-pipeline.env
+WorkingDirectory=/root/tradingview-desktop-mcp/pipeline
+ExecStart=/usr/bin/python3 /root/tradingview-desktop-mcp/pipeline/resolver.py
