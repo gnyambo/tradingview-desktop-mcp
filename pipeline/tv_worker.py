@@ -5,7 +5,10 @@ tv-worker: watches the scanner's SQLite history for NEW MTF-qualified setups and
   - source:        the scanner observation (symbol, bias, scores, macro)
   - scanner_plan:  the scanner's own entry/SL/TP (baseline, never shown to /tv)
   - tv:            the JSON block /tv returned (or null on failure / cap)
-The resolver later tracks both legs on the same candles.
+The resolver later tracks all legs on the same candles.
+
+TV_RUN_CLAUDE=0 (in /etc/tv-pipeline.env) switches the /tv runs off: every alert still gets a
+plan file (scanner, scanner_market and rule legs), but no Claude, no TradingView, no TV PLAN message.
 
 "NEW" mirrors monitor_scanner_TELEGRAM.notify_changes(): a symbol MTF-qualified in a scan
 run that was not MTF-qualified in the previous scan run.
@@ -42,6 +45,7 @@ RUN_TIMEOUT_S = int(os.environ.get("TV_RUN_TIMEOUT", "900"))
 SEND_GRADES = set(os.environ.get("TV_TELEGRAM_GRADES", "A,B,C").split(","))
 MAX_AGE_MIN = int(os.environ.get("TV_MAX_AGE_MIN", "60"))  # older setups (e.g. after downtime): scanner-only
 SHOTS_KEEP_DAYS = int(os.environ.get("TV_SHOTS_KEEP_DAYS", "30"))
+RUN_CLAUDE = os.environ.get("TV_RUN_CLAUDE", "1").strip() != "0"  # 0 = record alerts only, no /tv runs
 SETTLE_S = 120  # only read a scan run once it is this old, so it is fully written
 # Claude gets no shell at all: the worker starts/stops TradingView itself.
 ALLOWED_TOOLS = "mcp__binance,mcp__tradingview"
@@ -123,15 +127,29 @@ def plan_id(obs: dict) -> str:
     return f"{t.strftime('%Y%m%dT%H%MZ')}_{obs['symbol']}"
 
 
+DUP_WINDOW_H = 96  # a plan-only alert blocks repeats at most this long (72h timeout + entry slack)
+
+
 def active_plan_for(symbol: str, bias: str) -> str | None:
+    """Same symbol+bias while the earlier plan is still live -> skip, so one move is counted once.
+    Live = the /tv leg is not finished (when /tv ran), else the scanner_market leg is not finished
+    (a missing leg counts as live until the resolver has looked at it)."""
     for p in iter_plan_paths():
         try:
             pl = load_json(p)
         except Exception:
             continue
         src = pl.get("source", {})
-        if src.get("symbol") == symbol and src.get("trade_bias") == bias and pl.get("tv") \
-                and not pl.get("legs", {}).get("tv", {}).get("final"):
+        if src.get("symbol") != symbol or src.get("trade_bias") != bias or pl.get("final"):
+            continue
+        legs = pl.get("legs", {})
+        if pl.get("tv"):
+            live = not legs.get("tv", {}).get("final")
+        else:
+            created = parse_utc(pl.get("created_at_utc"))
+            live = bool(created) and (utcnow() - created).total_seconds() < DUP_WINDOW_H * 3600 \
+                and not legs.get("scanner_market", {}).get("final")
+        if live:
             return p.name
     return None
 
@@ -345,6 +363,8 @@ def process(obs: dict, st: dict, dry_run: bool) -> None:
     if dry_run:
         age = (utcnow() - parse_utc(obs["observed_at"])).total_seconds() / 60
         note = f"  [would be scanner-only: {age:.0f} min old]" if age > MAX_AGE_MIN else ""
+        if not RUN_CLAUDE:
+            note += "  [/tv disabled: plan file only]"
         log(f"NEW {tag}  prompt: {build_prompt(obs)}{note}")
         return
 
@@ -354,6 +374,11 @@ def process(obs: dict, st: dict, dry_run: bool) -> None:
         plan["run"] = {"ran": False, "skipped": f"stale: setup {age_min:.0f} min old"}
         save_json(path, plan)  # scanner leg is still tracked
         log(f"stale ({age_min:.0f} min), saved scanner-only {pid}")
+        return
+    if not RUN_CLAUDE:
+        plan["run"] = {"ran": False, "skipped": "tv disabled"}
+        save_json(path, plan)  # scanner, scanner_market and rule legs are still tracked
+        log(f"/tv disabled, saved {pid}")
         return
     if runs_today() >= DAILY_CAP:
         plan["run"] = {"ran": False, "skipped": "daily cap"}
@@ -430,7 +455,8 @@ def main():
     if not a.dry_run:
         # after a crash or reboot TradingView may still be running from an unfinished run
         sh("systemctl", "stop", "tradingview")
-        log(f"tv-worker started (state: last scan run {st.get('last_scan_run_id')})")
+        log(f"tv-worker started (state: last scan run {st.get('last_scan_run_id')}, "
+            f"/tv runs {'on' if RUN_CLAUDE else 'OFF'})")
     while True:
         try:
             tick(st, a.dry_run, a.since_run)

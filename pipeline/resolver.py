@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Resolver: replays closed 15m Binance candles for every unresolved plan file and
-records what happened to each leg ("tv" = the /tv plan, "scanner" = the scanner's
-own levels for the same alert). No Claude, no TradingView.
+records what happened to each leg. No Claude, no TradingView.
+
+Legs (all on the same alert):
+- tv              the /tv plan (only when /tv ran)
+- tv_market       what-if: market entry when /tv issued its plan, /tv's SL/TP
+- scanner         the scanner's own levels, entered as the scanner says (LIMIT_ZONE = limit)
+- scanner_market  what-if: market entry when the alert is seen, the scanner's own SL/TP
+                  (STALE_LEVELS when price is already past the scanner's TP1)
+- rule_atr        no-analysis baseline: market, SL 1.5x / TP1 1.5x / TP2 3x 15m ATR
+- rule_wide       same with wide stops: SL 3x / TP1 3x / TP2 6x ATR (~2% stops, fees a small share of R)
 
 Rules (agreed):
 - Same candle touches SL and a target -> SL counts (conservative).
@@ -29,6 +37,10 @@ TIMEOUT_H = 72
 RULE_SL_ATR = float(os.environ.get("TV_RULE_SL_ATR", "1.5"))
 RULE_TP1_ATR = float(os.environ.get("TV_RULE_TP1_ATR", "1.5"))   # = 1R
 RULE_TP2_ATR = float(os.environ.get("TV_RULE_TP2_ATR", "3.0"))   # = 2R
+# wide-stop variant: about 2% stops on typical alts, so the 0.10% fee is ~5% of R instead of ~12%
+RULE_WIDE_SL_ATR = float(os.environ.get("TV_RULE_WIDE_SL_ATR", "3.0"))
+RULE_WIDE_TP1_ATR = float(os.environ.get("TV_RULE_WIDE_TP1_ATR", "3.0"))   # = 1R
+RULE_WIDE_TP2_ATR = float(os.environ.get("TV_RULE_WIDE_TP2_ATR", "6.0"))   # = 2R
 DEFAULT_VALID_H = 24
 
 
@@ -222,17 +234,24 @@ def leg_specs(plan: dict) -> dict:
         specs["tv_market"] = m
     src = plan.get("source") or {}
     direction = direction_from_bias(src.get("trade_bias"))
-    if direction:
-        # same start as /tv @ market when /tv ran, otherwise the scanner's observation time
-        rstart = parse_utc(plan.get("created_at_utc")) if tv else parse_utc(src.get("observed_at"))
-        specs["rule_atr"] = {"direction": direction, "setup": "TAKE_NOW", "entry_type": "market_now",
-                             "entry": None, "sl": None, "tp1": None, "tp2": None, "trigger": None,
-                             "cancel_if": None, "start": rstart, "valid_until": add_hours(rstart, DEFAULT_VALID_H),
-                             "atr_rule": True}
+    # all market legs start together: when /tv issued its plan if it ran, else the scanner's observation time
+    mstart = parse_utc(plan.get("created_at_utc")) if tv else parse_utc(src.get("observed_at"))
+    if direction and mstart:
+        for name, mult in (("rule_atr", (RULE_SL_ATR, RULE_TP1_ATR, RULE_TP2_ATR)),
+                           ("rule_wide", (RULE_WIDE_SL_ATR, RULE_WIDE_TP1_ATR, RULE_WIDE_TP2_ATR))):
+            specs[name] = {"direction": direction, "setup": "TAKE_NOW", "entry_type": "market_now",
+                           "entry": None, "sl": None, "tp1": None, "tp2": None, "trigger": None,
+                           "cancel_if": None, "start": mstart, "valid_until": add_hours(mstart, DEFAULT_VALID_H),
+                           "atr_mult": mult}
     sp = plan.get("scanner_plan")
     if sp:
         start = parse_utc(plan["source"]["observed_at"])
         specs["scanner"] = spec_from_scanner(sp, start)
+        if mstart:
+            # what-if: market entry when the alert is seen, with the scanner's own SL/TP
+            specs["scanner_market"] = dict(spec_from_scanner(sp, mstart), setup="TAKE_NOW",
+                                           entry_type="market_now", entry=None,
+                                           direction=sp.get("direction") or direction)
     return specs
 
 
@@ -249,21 +268,27 @@ def resolve_plan(path, verbose=False, recompute=False) -> bool:
             save_json(path, plan)
         return False
     changed = False
+    candle_cache, atr_cache = {}, {}  # legs sharing a start time share one download
     for name, spec in specs.items():
         if legs.get(name, {}).get("final") and not recompute:
             continue
         start = spec["start"]
-        candles = klines_15m(symbol, start, limit=1000)
+        if start not in candle_cache:
+            candle_cache[start] = klines_15m(symbol, start, limit=1000)
+        candles = candle_cache[start]
         extra = {}
-        if spec.get("atr_rule"):
+        mult = spec.get("atr_mult")
+        if mult:
             if not candles:
                 continue  # first candle after start not closed yet
-            atr = atr14(klines_15m_before(symbol, start))
+            if start not in atr_cache:
+                atr_cache[start] = atr14(klines_15m_before(symbol, start))
+            atr = atr_cache[start]
             if not atr:
                 continue
+            sl_m, tp1_m, tp2_m = mult
             e, s = candles[0]["o"], (1 if spec["direction"] == "long" else -1)
-            spec = dict(spec, sl=e - s * RULE_SL_ATR * atr, tp1=e + s * RULE_TP1_ATR * atr,
-                        tp2=e + s * RULE_TP2_ATR * atr)
+            spec = dict(spec, sl=e - s * sl_m * atr, tp1=e + s * tp1_m * atr, tp2=e + s * tp2_m * atr)
             extra = {"atr": round(atr, 10), "levels": {"sl": spec["sl"], "tp1": spec["tp1"], "tp2": spec["tp2"]}}
         res = replay(spec, candles)
         res.update(extra)

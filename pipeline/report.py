@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Report: compares the /tv plans with the scanner's own levels on the same alerts,
-and breaks /tv results down by grade and by rubric criterion.
-Usage: python3 report.py [--since YYYY-MM-DD]
+breaks /tv results down by grade and by rubric criterion, compares market entries,
+and scores the forward test (scanner @ market, fresh alerts only, vs the wide-stop rule).
+Usage: python3 report.py [--since YYYY-MM-DD] [--forward-from "YYYY-MM-DD HH:MM"]
 """
 import argparse
+import math
 import os
 from collections import defaultdict
 
@@ -17,6 +19,14 @@ def stop_bucket(entry, sl, atr):
         return None
     return "stop < 1x ATR" if m < 1 else ("stop 1-2x ATR" if m <= 2 else "stop > 2x ATR")
 
+
+# Forward test, fixed in advance (2026-10-25). Counted only on alerts created from FORWARD_FROM (UTC)
+# where the scanner's levels were NOT stale. Pass = after FORWARD_N resolved trades, scanner @ market
+# averages >= FORWARD_MIN_R after fees, beats rule_wide on the same alerts, with >= FORWARD_MIN_LONGS longs.
+FORWARD_FROM = os.environ.get("TV_FORWARD_FROM", "2026-10-26 00:00")
+FORWARD_N = 30
+FORWARD_MIN_R = 0.10
+FORWARD_MIN_LONGS = 5
 
 CRITERIA = ("d1_alignment", "h4_alignment", "location", "confirmation_15m", "rr_tp1", "stop_quality")
 
@@ -41,11 +51,32 @@ def leg_usd(leg: dict, sl) -> float | None:
     return NOTIONAL_USD * (r * stop_pct - FEE_ROUNDTRIP_PCT / 100)
 
 
+def net_r(leg: dict, sl) -> float | None:
+    """R after the round-trip fee (fee as a share of the stop distance)."""
+    try:
+        fill, r = float(leg["fill_price"]), float(leg["r"])
+        stop_pct = abs(fill - float(sl)) / fill * 100
+        return r - FEE_ROUNDTRIP_PCT / stop_pct
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def mean_se(xs: list[float]) -> tuple[float | None, float | None]:
+    if not xs:
+        return None, None
+    m = sum(xs) / len(xs)
+    if len(xs) < 2:
+        return m, None
+    sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+    return m, sd / math.sqrt(len(xs))
+
+
 class Bucket:
     def __init__(self):
         self.n = self.entered = self.wins = self.losses = self.timeouts = self.live = 0
         self.not_entered = defaultdict(int)
         self.rs = []
+        self.net_rs = []
         self.usd = []
         self.risk_usd = []
 
@@ -72,6 +103,9 @@ class Bucket:
         if leg.get("r") is not None:
             self.rs.append(leg["r"])
             sl = sl if sl is not None else (leg.get("levels") or {}).get("sl")
+            nr = net_r(leg, sl) if sl is not None else None
+            if nr is not None:
+                self.net_rs.append(nr)
             usd = leg_usd(leg, sl) if sl is not None else None
             if usd is not None:
                 self.usd.append(usd)
@@ -97,6 +131,8 @@ class Bucket:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", help="only plans created on/after this UTC date")
+    ap.add_argument("--forward-from", default=FORWARD_FROM,
+                    help=f"start of the forward test, UTC (default {FORWARD_FROM})")
     a = ap.parse_args()
 
     plans = []
@@ -115,6 +151,9 @@ def main():
     by_grade, by_conflict = defaultdict(Bucket), defaultdict(Bucket)
     by_crit = {c: defaultdict(Bucket) for c in CRITERIA}
     sc_by_stop, tv_by_stop = defaultdict(Bucket), defaultdict(Bucket)
+    sc_mkt_all, wide_all = Bucket(), Bucket()
+    fw_sc, fw_wide, fw_rule = Bucket(), Bucket(), Bucket()  # forward test: fresh alerts only
+    fw_alerts = fw_stale = fw_longs = 0
     failed = capped = 0
     cost = 0.0
     for pl in plans:
@@ -122,6 +161,20 @@ def main():
         sp = pl.get("scanner_plan") or {}
         sc_all.add(legs.get("scanner"), sp.get("sl"))
         rule_all.add(legs.get("rule_atr"))
+        smk = legs.get("scanner_market")
+        if smk:
+            sc_mkt_all.add(smk, sp.get("sl"))
+            wide_all.add(legs.get("rule_wide"))
+        if (pl.get("created_at_utc") or "") >= a.forward_from:
+            fw_alerts += 1
+            if smk and smk.get("state") == "STALE_LEVELS":
+                fw_stale += 1
+            elif smk and smk.get("fill_price") is not None:
+                fw_sc.add(smk, sp.get("sl"))
+                fw_wide.add(legs.get("rule_wide"))
+                fw_rule.add(legs.get("rule_atr"))
+                if smk.get("result"):
+                    fw_longs += sp.get("direction") == "long"
         run = pl.get("run", {})
         cost += run.get("cost_usd") or 0
         if run.get("skipped"):
@@ -172,7 +225,42 @@ def main():
     for c in CRITERIA:
         for score in sorted(by_crit[c], key=str):
             print(by_crit[c][score].line(f"{c}={score}"))
+    print("\n== market entries, all alerts (scanner_market: stale alerts are not entered) ==")
+    print(sc_all.line("scanner @ limit"))
+    print(sc_mkt_all.line("scanner @ market"))
+    print(wide_all.line("rule wide @ market"))
+    print(rule_all.line("rule @ market"))
+
+    print(f"\n== FORWARD TEST from {a.forward_from} UTC: fresh alerts only (fixed 2026-10-25) ==")
+    print(f"alerts {fw_alerts} | stale (skipped) {fw_stale} | fresh entered {fw_sc.entered + fw_sc.live}")
+    print(fw_sc.line("scanner @ market"))
+    print(fw_wide.line("rule wide (same)"))
+    print(fw_rule.line("rule (same)"))
+    n = len(fw_sc.net_rs)
+    m_sc, se_sc = mean_se(fw_sc.net_rs)
+    m_wd, _ = mean_se(fw_wide.net_rs)
+    if m_sc is not None:
+        se_txt = f" ± {se_sc:.2f}" if se_sc is not None else ""
+        wd_txt = f"{m_wd:+.2f}R" if m_wd is not None else "-"
+        print(f"after fees: scanner @ market {m_sc:+.2f}R{se_txt} per trade | rule wide {wd_txt} | "
+              f"longs resolved {fw_longs}")
+    if n < FORWARD_N:
+        print(f"VERDICT: not yet - {n}/{FORWARD_N} resolved fresh trades")
+    else:
+        fails = []
+        if m_sc < FORWARD_MIN_R:
+            fails.append(f"avg {m_sc:+.2f}R < {FORWARD_MIN_R:+.2f}R")
+        if m_wd is not None and m_sc <= m_wd:
+            fails.append("does not beat rule wide")
+        if fw_longs < FORWARD_MIN_LONGS:
+            fails.append(f"only {fw_longs} longs (< {FORWARD_MIN_LONGS}): one-sided market")
+        print("VERDICT: PASS" if not fails else "VERDICT: FAIL - " + "; ".join(fails))
+
     print("\n/tv @ market = what-if: entered at market when the plan was issued, same SL/TP as /tv.")
+    print("scanner @ market = what-if: market entry when the alert is seen, the scanner's own SL/TP; "
+          "stale = price already past the scanner's TP1 at that moment (not entered).")
+    print("rule wide = same as rule but SL 3x / TP1 3x / TP2 6x 15m ATR (~2% stops). "
+          "Forward-test R is after fees (fee / stop distance).")
     print("rule @ market = no Claude: market entry in the scanner's direction, SL 1.5x ATR, TP1 1R, TP2 2R "
           "(compare avg R, not win rate: the targets differ).")
     print(f"$ = your sizing: ${NOTIONAL_USD:.0f} notional per trade (margin x leverage), "
