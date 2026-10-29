@@ -132,8 +132,8 @@ DUP_WINDOW_H = 96  # a plan-only alert blocks repeats at most this long (72h tim
 
 def active_plan_for(symbol: str, bias: str) -> str | None:
     """Same symbol+bias while the earlier plan is still live -> skip, so one move is counted once.
-    Live = the /tv leg is not finished (when /tv ran), else the scanner_market leg is not finished
-    (a missing leg counts as live until the resolver has looked at it)."""
+    Live = the /tv leg is not finished (when /tv ran), else ANY leg of the plan is not finished
+    (stale alerts close scanner_market at once, but their rule trades keep running)."""
     for p in iter_plan_paths():
         try:
             pl = load_json(p)
@@ -147,8 +147,7 @@ def active_plan_for(symbol: str, bias: str) -> str | None:
             live = not legs.get("tv", {}).get("final")
         else:
             created = parse_utc(pl.get("created_at_utc"))
-            live = bool(created) and (utcnow() - created).total_seconds() < DUP_WINDOW_H * 3600 \
-                and not legs.get("scanner_market", {}).get("final")
+            live = bool(created) and (utcnow() - created).total_seconds() < DUP_WINDOW_H * 3600
         if live:
             return p.name
     return None

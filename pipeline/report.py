@@ -10,7 +10,10 @@ import math
 import os
 from collections import defaultdict
 
-from common import FEE_ROUNDTRIP_PCT, NOTIONAL_USD, iter_plan_paths, load_json
+from datetime import timedelta
+
+from common import (FEE_ROUNDTRIP_PCT, NOTIONAL_USD, direction_from_bias, fmt_utc, iter_plan_paths,
+                    load_json, parse_utc)
 
 def stop_bucket(entry, sl, atr):
     try:
@@ -20,9 +23,12 @@ def stop_bucket(entry, sl, atr):
     return "stop < 1x ATR" if m < 1 else ("stop 1-2x ATR" if m <= 2 else "stop > 2x ATR")
 
 
-# Forward test, fixed in advance (2026-10-25). Counted only on alerts created from FORWARD_FROM (UTC)
-# where the scanner's levels were NOT stale. Pass = after FORWARD_N resolved trades, scanner @ market
-# averages >= FORWARD_MIN_R after fees, beats rule_wide on the same alerts, with >= FORWARD_MIN_LONGS longs.
+# Forward tests, pass marks fixed in advance (2026-10-25). Alerts created from FORWARD_FROM (UTC),
+# repeats of a move already counted left out.
+# PRIMARY (from 2026-10-29): rule_wide = Step-7 alert, market entry, SL 3x / TP1 3x 15m ATR, on ALL
+#   alerts. Pass = after FORWARD_N resolved trades, >= FORWARD_MIN_R after fees, >= FORWARD_MIN_LONGS longs.
+# INFORMATION ONLY: scanner_market on fresh alerts (Step-8 levels, mostly stale, too few trades).
+#   Its original pass mark is still printed: also had to beat rule_wide on the same alerts.
 FORWARD_FROM = os.environ.get("TV_FORWARD_FROM", "2026-10-26 00:00")
 FORWARD_N = 30
 FORWARD_MIN_R = 0.10
@@ -61,6 +67,41 @@ def net_r(leg: dict, sl) -> float | None:
         return None
 
 
+def verdict(net_rs: list[float], longs: int, rival: float | None = None, rival_name: str = "") -> str:
+    """The pre-registered pass mark, applied to after-fee R of resolved trades."""
+    n = len(net_rs)
+    if n < FORWARD_N:
+        return f"not yet - {n}/{FORWARD_N} resolved trades, {longs}/{FORWARD_MIN_LONGS} longs"
+    m, _ = mean_se(net_rs)
+    fails = []
+    if m < FORWARD_MIN_R:
+        fails.append(f"avg {m:+.2f}R < {FORWARD_MIN_R:+.2f}R")
+    if rival is not None and m <= rival:
+        fails.append(f"does not beat {rival_name}")
+    if longs < FORWARD_MIN_LONGS:
+        fails.append(f"only {longs} longs (< {FORWARD_MIN_LONGS}): one-sided market")
+    return "PASS" if not fails else "FAIL - " + "; ".join(fails)
+
+
+def exposure(intervals: list[tuple[str, str, str]]) -> tuple[int, int]:
+    """(max same-direction positions open at once, hours with 2+ same-direction entries).
+    Open = filled_at .. closed_at (closed_at is when TP2/SL/timeout ended the leg, so an upper bound)."""
+    peak = 0
+    for d in ("long", "short"):
+        ev = []
+        for start, end, dd in intervals:
+            if dd == d:
+                ev += [(start, 1), (end, -1)]
+        cur = 0
+        for _, step in sorted(ev, key=lambda x: (x[0], x[1])):  # exits sort before entries at equal times
+            cur += step
+            peak = max(peak, cur)
+    by_hour = defaultdict(int)
+    for start, _, d in intervals:
+        by_hour[(start[:13], d)] += 1
+    return peak, sum(1 for v in by_hour.values() if v >= 2)
+
+
 def mean_se(xs: list[float]) -> tuple[float | None, float | None]:
     if not xs:
         return None, None
@@ -69,6 +110,34 @@ def mean_se(xs: list[float]) -> tuple[float | None, float | None]:
         return m, None
     sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
     return m, sd / math.sqrt(len(xs))
+
+
+REPEAT_WINDOW_H = 96  # same as tv_worker.DUP_WINDOW_H
+
+
+def mark_repeats(plans: list[dict]) -> int:
+    """Plan-only alerts (no /tv run) that repeat the same symbol+bias while an earlier counted plan
+    was still running get pl["_repeat"] = True, so one move is counted once. Same rule the worker
+    applies from 2026-10-29; this also cleans up the repeats recorded before that fix."""
+    end_by_key, n = {}, 0
+    for pl in sorted(plans, key=lambda x: x.get("created_at_utc") or ""):
+        if pl.get("tv"):
+            continue
+        src = pl.get("source") or {}
+        key, t = (src.get("symbol"), src.get("trade_bias")), pl.get("created_at_utc") or ""
+        if t < end_by_key.get(key, ""):
+            pl["_repeat"] = True
+            n += 1
+            continue
+        cap = parse_utc(t)
+        cap = fmt_utc(cap + timedelta(hours=REPEAT_WINDOW_H)) if cap else t
+        legs = (pl.get("legs") or {}).values()
+        if pl.get("final") and legs:
+            end = max((l.get("closed_at") or "") for l in legs)
+        else:
+            end = cap
+        end_by_key[key] = min(end, cap)
+    return n
 
 
 class Bucket:
@@ -151,22 +220,37 @@ def main():
     by_grade, by_conflict = defaultdict(Bucket), defaultdict(Bucket)
     by_crit = {c: defaultdict(Bucket) for c in CRITERIA}
     sc_by_stop, tv_by_stop = defaultdict(Bucket), defaultdict(Bucket)
-    sc_mkt_all, wide_all = Bucket(), Bucket()
+    sc_mkt_all, wide_all, mk_lim, mk_rule = Bucket(), Bucket(), Bucket(), Bucket()  # market-entry table
     fw_sc, fw_wide, fw_rule = Bucket(), Bucket(), Bucket()  # forward test: fresh alerts only
     fw_alerts = fw_stale = fw_longs = 0
+    pw_wide, pw_rule = Bucket(), Bucket()  # primary forward test: rule_wide on all alerts
+    pw_longs, pw_intervals = 0, []
     failed = capped = 0
     cost = 0.0
+    repeats = mark_repeats(plans)
     for pl in plans:
         legs = pl.get("legs", {})
         sp = pl.get("scanner_plan") or {}
         sc_all.add(legs.get("scanner"), sp.get("sl"))
         rule_all.add(legs.get("rule_atr"))
         smk = legs.get("scanner_market")
-        if smk:
+        if pl.get("_repeat"):
+            smk = None  # repeat of a move already counted: kept out of the market-entry and forward tables
+        elif smk:
             sc_mkt_all.add(smk, sp.get("sl"))
             wide_all.add(legs.get("rule_wide"))
-        if (pl.get("created_at_utc") or "") >= a.forward_from:
+            mk_lim.add(legs.get("scanner"), sp.get("sl"))
+            mk_rule.add(legs.get("rule_atr"))
+        if (pl.get("created_at_utc") or "") >= a.forward_from and not pl.get("_repeat"):
             fw_alerts += 1
+            wleg = legs.get("rule_wide")
+            pw_wide.add(wleg)
+            pw_rule.add(legs.get("rule_atr"))
+            pdir = direction_from_bias((pl.get("source") or {}).get("trade_bias"))
+            if wleg and wleg.get("result"):
+                pw_longs += pdir == "long"
+            if wleg and wleg.get("filled_at"):
+                pw_intervals.append((wleg["filled_at"], wleg.get("closed_at") or "9999-12-31 00:00", pdir))
             if smk and smk.get("state") == "STALE_LEVELS":
                 fw_stale += 1
             elif smk and smk.get("fill_price") is not None:
@@ -225,18 +309,32 @@ def main():
     for c in CRITERIA:
         for score in sorted(by_crit[c], key=str):
             print(by_crit[c][score].line(f"{c}={score}"))
-    print("\n== market entries, all alerts (scanner_market: stale alerts are not entered) ==")
-    print(sc_all.line("scanner @ limit"))
+    print(f"\n== market entries, all alerts (scanner_market: stale alerts are not entered; "
+          f"{repeats} repeat alerts of a move already counted left out) ==")
+    print(mk_lim.line("scanner @ limit"))
     print(sc_mkt_all.line("scanner @ market"))
     print(wide_all.line("rule wide @ market"))
-    print(rule_all.line("rule @ market"))
+    print(mk_rule.line("rule @ market"))
 
-    print(f"\n== FORWARD TEST from {a.forward_from} UTC: fresh alerts only (fixed 2026-10-25) ==")
+    print(f"\n== FORWARD TEST (PRIMARY) from {a.forward_from} UTC: Step-7 alert, market entry, "
+          f"rule wide stops, all alerts ==")
+    print(f"alerts {fw_alerts} (repeats of a move already counted left out)")
+    print(pw_wide.line("rule wide @ market"))
+    print(pw_rule.line("rule (tight, ref)"))
+    m_pw, se_pw = mean_se(pw_wide.net_rs)
+    if m_pw is not None:
+        se_txt = f" ± {se_pw:.2f}" if se_pw is not None else ""
+        print(f"after fees: rule wide {m_pw:+.2f}R{se_txt} per trade | longs resolved {pw_longs}")
+    peak, clusters = exposure(pw_intervals)
+    print(f"correlation: up to {peak} same-direction positions open at once | "
+          f"{clusters} hours with 2+ same-direction entries")
+    print(f"VERDICT (rule wide): {verdict(pw_wide.net_rs, pw_longs)}")
+
+    print(f"\n== scanner @ market, fresh alerts only (INFORMATION ONLY: Step-8 levels) ==")
     print(f"alerts {fw_alerts} | stale (skipped) {fw_stale} | fresh entered {fw_sc.entered + fw_sc.live}")
     print(fw_sc.line("scanner @ market"))
     print(fw_wide.line("rule wide (same)"))
     print(fw_rule.line("rule (same)"))
-    n = len(fw_sc.net_rs)
     m_sc, se_sc = mean_se(fw_sc.net_rs)
     m_wd, _ = mean_se(fw_wide.net_rs)
     if m_sc is not None:
@@ -244,17 +342,7 @@ def main():
         wd_txt = f"{m_wd:+.2f}R" if m_wd is not None else "-"
         print(f"after fees: scanner @ market {m_sc:+.2f}R{se_txt} per trade | rule wide {wd_txt} | "
               f"longs resolved {fw_longs}")
-    if n < FORWARD_N:
-        print(f"VERDICT: not yet - {n}/{FORWARD_N} resolved fresh trades")
-    else:
-        fails = []
-        if m_sc < FORWARD_MIN_R:
-            fails.append(f"avg {m_sc:+.2f}R < {FORWARD_MIN_R:+.2f}R")
-        if m_wd is not None and m_sc <= m_wd:
-            fails.append("does not beat rule wide")
-        if fw_longs < FORWARD_MIN_LONGS:
-            fails.append(f"only {fw_longs} longs (< {FORWARD_MIN_LONGS}): one-sided market")
-        print("VERDICT: PASS" if not fails else "VERDICT: FAIL - " + "; ".join(fails))
+    print(f"info verdict (scanner @ market): {verdict(fw_sc.net_rs, fw_longs, m_wd, 'rule wide')}")
 
     print("\n/tv @ market = what-if: entered at market when the plan was issued, same SL/TP as /tv.")
     print("scanner @ market = what-if: market entry when the alert is seen, the scanner's own SL/TP; "
