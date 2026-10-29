@@ -30,3 +30,8 @@ alerts from 2026-10-26 00:00 UTC, scanner direction + market entry + the scanner
 skipping alerts already past the scanner's TP1 ("stale"). PASS after 30 resolved fresh trades if
 it averages >= +0.10R after fees, beats rule_wide on the same alerts, and includes >= 5 longs.
 /tv runs are off for it: TV_RUN_CLAUDE=0 in /etc/tv-pipeline.env.
+
+Market legs are booked at the first 1m open after the alert (followed on 1m candles to the next 15m
+boundary, then 15m), not the next 15m open. Each alert also gets a "📐 levels" Telegram message about
+10-20 s after the scanner's alert (rule_wide SL/TP, $ risk, scanner zone with a stale flag, open
+same-direction plans); TV_LEVELS_TELEGRAM=0 turns it off.

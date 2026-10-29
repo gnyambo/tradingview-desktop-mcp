@@ -21,6 +21,9 @@ Rules (agreed):
 - A limit not yet filled when price touches TP1 -> CANCELLED (the move left without us).
 - Price already at/through TP1 on the first candle after issue -> STALE_LEVELS (obsolete plan).
 
+- Market legs (setup TAKE_NOW) enter at the open of the first 1m candle after the alert and are followed
+  on 1m candles up to the next 15m boundary, then on 15m candles. Limit/trigger legs use 15m candles.
+
 Each run replays from the start (stateless), so results are reproducible.
 Usage: python3 resolver.py [--plan PATH] [--verbose]
 """
@@ -29,8 +32,9 @@ import os
 import sys
 from pathlib import Path
 
-from common import (LEG_FINAL, PLANS_DIR, add_hours, atr14, klines_15m_before, direction_from_bias, fmt_utc, from_ms, iter_plan_paths,
-                    klines_15m, load_json, parse_utc, plan_is_final, save_json, to_ms, utcnow)
+from common import (LEG_FINAL, PLANS_DIR, add_hours, atr14, klines_15m_before, direction_from_bias, entry_series,
+                    fmt_utc, from_ms, iter_plan_paths, klines_15m, load_json, parse_utc, plan_is_final, save_json,
+                    to_ms, utcnow)
 
 TIMEOUT_H = 72
 # fixed-rule baseline (no Claude): market entry in the scanner's direction, stop/targets in 15m ATR
@@ -273,9 +277,11 @@ def resolve_plan(path, verbose=False, recompute=False) -> bool:
         if legs.get(name, {}).get("final") and not recompute:
             continue
         start = spec["start"]
-        if start not in candle_cache:
-            candle_cache[start] = klines_15m(symbol, start, limit=1000)
-        candles = candle_cache[start]
+        market = spec.get("setup") == "TAKE_NOW"
+        key = (start, market)
+        if key not in candle_cache:
+            candle_cache[key] = entry_series(symbol, start) if market else klines_15m(symbol, start, limit=1000)
+        candles = candle_cache[key]
         extra = {}
         mult = spec.get("atr_mult")
         if mult:

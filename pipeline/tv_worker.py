@@ -7,6 +7,10 @@ tv-worker: watches the scanner's SQLite history for NEW MTF-qualified setups and
   - tv:            the JSON block /tv returned (or null on failure / cap)
 The resolver later tracks all legs on the same candles.
 
+Each new alert also gets a "📐 levels" Telegram message (TV_LEVELS_TELEGRAM=0 turns it off): market
+price, the rule_wide SL/TP being forward-tested, $ risk, the scanner's zone (flagged when its TP1 is
+already passed) and the same-direction plans already open.
+
 TV_RUN_CLAUDE=0 (in /etc/tv-pipeline.env) switches the /tv runs off: every alert still gets a
 plan file (scanner, scanner_market and rule legs), but no Claude, no TradingView, no TV PLAN message.
 
@@ -32,21 +36,26 @@ import time
 import traceback
 from pathlib import Path
 
-from common import (PLANS_DIR, SYMBOL_RE, WORD_RE, direction_from_bias, fmt_utc, iter_plan_paths,
-                    load_json, parse_utc, plan_header, save_json, telegram_send, utcnow)
+from common import (NOTIONAL_USD, PLANS_DIR, SYMBOL_RE, WORD_RE, atr14, direction_from_bias, fmt_px, fmt_utc,
+                    iter_plan_paths, klines_15m_before, load_json, parse_utc, plan_header, price_now, risk_text,
+                    save_json, telegram_send, utcnow)
+from resolver import RULE_WIDE_SL_ATR, RULE_WIDE_TP1_ATR, RULE_WIDE_TP2_ATR
 
 SCANNER_DB = os.environ.get("TV_SCANNER_DB", "/opt/binance-futures-scanner/scanner_history.db")
 STATE_PATH = PLANS_DIR / ".worker_state.json"
 RUN_DIR = Path(os.environ.get("TV_RUN_DIR", "/var/lib/tv-worker"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-POLL_S = int(os.environ.get("TV_POLL_SECONDS", "60"))
+POLL_S = int(os.environ.get("TV_POLL_SECONDS", "10"))
 DAILY_CAP = int(os.environ.get("TV_DAILY_CAP", "15"))
 RUN_TIMEOUT_S = int(os.environ.get("TV_RUN_TIMEOUT", "900"))
 SEND_GRADES = set(os.environ.get("TV_TELEGRAM_GRADES", "A,B,C").split(","))
 MAX_AGE_MIN = int(os.environ.get("TV_MAX_AGE_MIN", "60"))  # older setups (e.g. after downtime): scanner-only
 SHOTS_KEEP_DAYS = int(os.environ.get("TV_SHOTS_KEEP_DAYS", "30"))
 RUN_CLAUDE = os.environ.get("TV_RUN_CLAUDE", "1").strip() != "0"  # 0 = record alerts only, no /tv runs
-SETTLE_S = 120  # only read a scan run once it is this old, so it is fully written
+LEVELS_TELEGRAM = os.environ.get("TV_LEVELS_TELEGRAM", "1").strip() != "0"
+# The scanner writes a whole scan in ONE transaction, before it sends its Telegram alert, so a visible
+# scan run is already complete; a few seconds of margin is enough.
+SETTLE_S = int(os.environ.get("TV_SETTLE_SECONDS", "5"))
 # Claude gets no shell at all: the worker starts/stops TradingView itself.
 ALLOWED_TOOLS = "mcp__binance,mcp__tradingview"
 CDP_URL = os.environ.get("TV_CDP_URL", "http://127.0.0.1:9222/json/list")
@@ -185,6 +194,67 @@ def base_plan(obs: dict) -> dict:
         "legs": {},
         "final": False,
     }
+
+
+# ------------------------------------------------------------------ levels message
+
+def open_same_direction(direction: str) -> list[str]:
+    """Coins with a tracked plan in this direction whose rule_wide trade is still running."""
+    out = set()
+    for p in iter_plan_paths():
+        try:
+            pl = load_json(p)
+        except Exception:
+            continue
+        src = pl.get("source") or {}
+        if pl.get("final") or direction_from_bias(src.get("trade_bias")) != direction:
+            continue
+        created = parse_utc(pl.get("created_at_utc"))
+        if not created or (utcnow() - created).total_seconds() > DUP_WINDOW_H * 3600:
+            continue
+        if ((pl.get("legs") or {}).get("rule_wide") or {}).get("final"):
+            continue
+        out.add(str(src.get("symbol", "?")).removesuffix("USDT"))
+    return sorted(out)
+
+
+def alert_levels(obs: dict, plan: dict) -> dict | None:
+    """Levels at alert time, the same rule the forward test tracks (rule_wide). Never raises."""
+    try:
+        symbol, direction = obs["symbol"], direction_from_bias(obs["trade_bias"])
+        sign = 1 if direction == "long" else -1
+        px = price_now(symbol)
+        atr = atr14(klines_15m_before(symbol, parse_utc(obs["observed_at"])))
+        if not px or not atr:
+            return None
+        sl, tp1, tp2 = (px - sign * RULE_WIDE_SL_ATR * atr, px + sign * RULE_WIDE_TP1_ATR * atr,
+                        px + sign * RULE_WIDE_TP2_ATR * atr)
+        lines = [f"📐 {symbol} {direction.upper()} · levels (forward test, not validated yet)",
+                 f"Market ≈ {fmt_px(px)} · 15m ATR {fmt_px(atr)} ({atr / px * 100:.2f}%)",
+                 f"SL {fmt_px(sl)} · TP1 {fmt_px(tp1)} (1R) · TP2 {fmt_px(tp2)} (2R)",
+                 f"{risk_text(px, sl)} (${NOTIONAL_USD:.0f} notional)"]
+        sp = plan.get("scanner_plan") or {}
+        if sp.get("entry") is not None and sp.get("sl") is not None and sp.get("tp1") is not None:
+            flag = ""
+            if (px - float(sp["tp1"])) * sign >= 0:
+                flag = " ⚠️ TP1 already passed"
+            elif (px - float(sp["sl"])) * sign <= 0:
+                flag = " ⚠️ price beyond the zone's stop"
+            lines.append(f"Scanner zone: limit {fmt_px(sp['entry'])} · SL {fmt_px(sp['sl'])} · "
+                         f"TP1 {fmt_px(sp['tp1'])}{flag}")
+        others = open_same_direction(direction)
+        lines.append(f"Already open {direction} (tracked): {', '.join(others)}" if others
+                     else f"No other {direction} open (tracked)")
+        return {"at_utc": fmt_utc(utcnow()), "price": px, "atr15m": atr, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "open_same_direction": others, "text": "\n".join(lines)}
+    except Exception as e:
+        log(f"levels for {obs.get('symbol')} failed: {e}")
+        return None
+
+
+def send_levels(lv: dict | None) -> None:
+    if LEVELS_TELEGRAM and lv:
+        telegram_send(lv["text"])
 
 
 # ------------------------------------------------------------------ running /tv
@@ -374,16 +444,22 @@ def process(obs: dict, st: dict, dry_run: bool) -> None:
         save_json(path, plan)  # scanner leg is still tracked
         log(f"stale ({age_min:.0f} min), saved scanner-only {pid}")
         return
+    lv = alert_levels(obs, plan)
+    if lv:
+        plan["alert_levels"] = {k: v for k, v in lv.items() if k != "text"}
     if not RUN_CLAUDE:
         plan["run"] = {"ran": False, "skipped": "tv disabled"}
         save_json(path, plan)  # scanner, scanner_market and rule legs are still tracked
         log(f"/tv disabled, saved {pid}")
+        send_levels(lv)
         return
     if runs_today() >= DAILY_CAP:
         plan["run"] = {"ran": False, "skipped": "daily cap"}
         save_json(path, plan)  # scanner leg is still tracked
         log(f"cap reached, saved scanner-only {pid}")
+        send_levels(lv)
         return
+    send_levels(lv)  # before the 1-2 minute /tv run
 
     log(f"running /tv for {tag}")
     out = run_tv(obs, pid)
@@ -455,7 +531,8 @@ def main():
         # after a crash or reboot TradingView may still be running from an unfinished run
         sh("systemctl", "stop", "tradingview")
         log(f"tv-worker started (state: last scan run {st.get('last_scan_run_id')}, "
-            f"/tv runs {'on' if RUN_CLAUDE else 'OFF'})")
+            f"/tv runs {'on' if RUN_CLAUDE else 'OFF'}, levels msg {'on' if LEVELS_TELEGRAM else 'OFF'}, "
+            f"poll {POLL_S}s, settle {SETTLE_S}s)")
     while True:
         try:
             tick(st, a.dry_run, a.since_run)

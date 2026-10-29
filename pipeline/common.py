@@ -88,6 +88,37 @@ def klines_15m_before(symbol: str, end: datetime, n: int = 16) -> list[dict]:
             for k in raw if int(k[6]) < to_ms(end)]
 
 
+def _klines(symbol: str, interval: str, start: datetime, limit: int) -> list[dict]:
+    """Closed candles of `interval` whose open time is >= start."""
+    raw = http_json(f"{FAPI}/fapi/v1/klines",
+                    {"symbol": symbol, "interval": interval, "startTime": to_ms(start), "limit": limit})
+    now_ms = to_ms(utcnow())
+    return [{"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+             "c": float(k[4]), "ct": int(k[6])}
+            for k in raw if int(k[6]) < now_ms and int(k[0]) >= to_ms(start)]
+
+
+def entry_series(symbol: str, start: datetime, limit: int = 1000) -> list[dict]:
+    """Candles for a MARKET entry at `start`: 1m candles from the first minute after start up to the
+    next 15m boundary, then 15m candles. So the entry is the price about a minute after the alert,
+    not the next 15m open (up to 15 min later), and the path is still followed candle by candle."""
+    start_ms = to_ms(start)
+    boundary_ms = -(-start_ms // 900_000) * 900_000  # ceil to the 15m grid
+    series = []
+    if boundary_ms > start_ms:
+        series = [c for c in _klines(symbol, "1m", start, 16) if c["t"] < boundary_ms]
+        if not series or series[-1]["ct"] + 1 < boundary_ms:
+            return series  # the 1m stretch is not complete yet: no 15m candles can follow
+    return series + klines_15m(symbol, from_ms(boundary_ms), limit=limit)
+
+
+def price_now(symbol: str) -> float | None:
+    try:
+        return float(http_json(f"{FAPI}/fapi/v1/ticker/price", {"symbol": symbol})["price"])
+    except Exception:
+        return None
+
+
 def atr14(candles: list[dict]) -> float | None:
     """Simple average of the last 14 true ranges (same definition as binance_swings atr14)."""
     trs = [max(c["h"] - c["l"], abs(c["h"] - p["c"]), abs(c["l"] - p["c"]))
