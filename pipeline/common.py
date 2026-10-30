@@ -21,7 +21,7 @@ LEVERAGE = float(os.environ.get("TV_LEVERAGE", "10"))
 MMR_PCT = float(os.environ.get("TV_MMR_PCT", "0.5"))                    # rough maintenance margin
 WARN_STOP_PCT = float(os.environ.get("TV_WARN_STOP_PCT", "5"))
 FEE_ROUNDTRIP_PCT = float(os.environ.get("TV_FEE_ROUNDTRIP_PCT", "0.10"))
-RISK_USD = float(os.environ.get("TV_RISK_USD", "50"))                  # $ lost at the stop, fees included
+RISK_USD = float(os.environ.get("TV_RISK_USD", "50"))  # fallback $ risk when the account balance is unknown
 LIQ_BUFFER = 1.5  # liquidation must sit at least this many stop-distances away
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}USDT$")
@@ -182,14 +182,17 @@ def safe_leverage(stop: float) -> int:
     return max(1, lev)
 
 
-def sizing_lines(entry, sl) -> list[str]:
-    """Position size for a fixed $ risk (RISK_USD at the stop, round-trip fee included)."""
+def sizing_lines(entry, sl, risk_usd: float | None = None, label: str | None = None) -> list[str]:
+    """Position size so that hitting the stop loses `risk_usd` (round-trip fee included).
+    Without a risk_usd the fixed RISK_USD fallback is used."""
     pct = stop_pct(entry, sl)
     if not pct:
         return []
-    notional = RISK_USD / ((pct + FEE_ROUNDTRIP_PCT) / 100)
+    risk = risk_usd if risk_usd else RISK_USD
+    head = f"{label} = ${risk:,.0f}" if label and risk_usd else f"${risk:,.0f} risk"
+    notional = risk / ((pct + FEE_ROUNDTRIP_PCT) / 100)
     lev = int(LEVERAGE)
-    lines = [f"Size for ${RISK_USD:.0f} risk (stop {pct:.1f}%): notional ${notional:,.0f} · "
+    lines = [f"Size for {head} (stop {pct:.1f}%): notional ${notional:,.0f} · "
              f"margin ${notional / lev:,.0f} at {lev}x"]
     safe = safe_leverage(pct)
     if safe < lev:

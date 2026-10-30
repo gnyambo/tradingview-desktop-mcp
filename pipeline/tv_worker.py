@@ -39,6 +39,7 @@ from pathlib import Path
 from common import (FEE_ROUNDTRIP_PCT, PLANS_DIR, RISK_USD, SYMBOL_RE, WORD_RE, atr14, direction_from_bias, fmt_px, fmt_utc,
                     iter_plan_paths, klines_15m_before, load_json, parse_utc, plan_header, price_now,
                     safe_leverage, save_json, sizing_lines, stop_pct, telegram_send, utcnow)
+from account import get_account, positions_lines, risk_budget
 from resolver import RULE_WIDE_SL_ATR, RULE_WIDE_TP1_ATR, RULE_WIDE_TP2_ATR
 
 SCANNER_DB = os.environ.get("TV_SCANNER_DB", "/opt/binance-futures-scanner/scanner_history.db")
@@ -229,10 +230,15 @@ def alert_levels(obs: dict, plan: dict) -> dict | None:
             return None
         sl, tp1, tp2 = (px - sign * RULE_WIDE_SL_ATR * atr, px + sign * RULE_WIDE_TP1_ATR * atr,
                         px + sign * RULE_WIDE_TP2_ATR * atr)
+        acct, acct_problem = get_account()
+        risk_usd, risk_pct, risk_label = risk_budget(acct)
+        equity_txt = f" of ${acct['equity_usdt']:,.0f}" if acct else ""
         lines = [f"📐 {symbol} {direction.upper()} · levels (forward test, not validated yet)",
                  f"Market ≈ {fmt_px(px)} · 15m ATR {fmt_px(atr)} ({atr / px * 100:.2f}%)",
                  f"SL {fmt_px(sl)} · TP1 {fmt_px(tp1)} (1R) · TP2 {fmt_px(tp2)} (2R)",
-                 *sizing_lines(px, sl)]
+                 *sizing_lines(px, sl, risk_usd, (risk_label + equity_txt) if risk_usd else None)]
+        if acct_problem:
+            lines.append(f"⚠️ {acct_problem}" + ("" if acct else f": sized at the fixed ${RISK_USD:.0f} fallback"))
         sp = plan.get("scanner_plan") or {}
         if sp.get("entry") is not None and sp.get("sl") is not None and sp.get("tp1") is not None:
             flag = ""
@@ -242,13 +248,19 @@ def alert_levels(obs: dict, plan: dict) -> dict | None:
                 flag = " ⚠️ price beyond the zone's stop"
             lines.append(f"Scanner zone: limit {fmt_px(sp['entry'])} · SL {fmt_px(sp['sl'])} · "
                          f"TP1 {fmt_px(sp['tp1'])}{flag}")
+        lines += positions_lines(acct, direction)
         others = open_same_direction(direction)
-        lines.append(f"Already open {direction} (tracked): {', '.join(others)}" if others
-                     else f"No other {direction} open (tracked)")
+        if others:
+            lines.append(f"Test plans open {direction}: {', '.join(others)}")
         pct = stop_pct(px, sl)
+        used = risk_usd or RISK_USD
         return {"at_utc": fmt_utc(utcnow()), "price": px, "atr15m": atr, "sl": sl, "tp1": tp1, "tp2": tp2,
-                "stop_pct": pct, "risk_usd": RISK_USD, "safe_leverage": safe_leverage(pct),
-                "notional_for_risk": RISK_USD / ((pct + FEE_ROUNDTRIP_PCT) / 100),
+                "stop_pct": pct, "risk_usd": used, "risk_pct": risk_pct if risk_usd else None,
+                "equity_usdt": acct["equity_usdt"] if acct else None,
+                "drawdown_pct": acct.get("drawdown_pct") if acct else None,
+                "real_open_positions": len(acct.get("positions") or []) if acct else None,
+                "safe_leverage": safe_leverage(pct),
+                "notional_for_risk": used / ((pct + FEE_ROUNDTRIP_PCT) / 100),
                 "open_same_direction": others, "text": "\n".join(lines)}
     except Exception as e:
         log(f"levels for {obs.get('symbol')} failed: {e}")

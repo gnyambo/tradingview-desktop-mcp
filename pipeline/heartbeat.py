@@ -79,6 +79,19 @@ def main():
         scan_m = None
         issues.append(f"scanner db unreadable: {e}")
 
+    acct_txt = "account: unknown"
+    try:  # the levels message sizes positions from the dashboard's balance
+        from account import _staleness, fetch_account
+        acct = fetch_account()
+        stale = _staleness(acct)
+        dd = acct.get("drawdown_pct")
+        acct_txt = (f"account ${acct['equity_usdt']:,.0f}" + (f", {dd:.1f}% below 30-day peak" if dd is not None else "")
+                    + f", {len(acct['positions'])} open")
+        if stale:
+            issues.append(f"{stale}: is the crypto-risk-app running?")
+    except Exception as e:
+        issues.append(f"dashboard database unreadable, levels use the fixed $ fallback: {str(e)[:120]}")
+
     free_gb = shutil.disk_usage("/").free / 1e9
     if free_gb < 2:
         issues.append(f"disk free only {free_gb:.1f} GB")
@@ -111,7 +124,8 @@ def main():
            f"worker {worker_state}, polled {ago(tick_m)} · resolver ran {ago(res_m)} · "
            f"scanner wrote {ago(scan_m)}\n"
            f"last 24h: alerts {alerts}, /tv runs {runs} (failed {fails}), est. cost ${cost:.2f}\n"
-           f"/tv plans resolved 24h: {res_txt} · live plans: {live} · disk free {free_gb:.0f} GB")
+           f"/tv plans resolved 24h: {res_txt} · live plans: {live} · disk free {free_gb:.0f} GB\n"
+           f"{acct_txt}")
     if issues:
         msg += "\n\nIssues:\n- " + "\n- ".join(issues)
     print(msg)

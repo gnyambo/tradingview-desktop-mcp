@@ -35,3 +35,9 @@ Market legs are booked at the first 1m open after the alert (followed on 1m cand
 boundary, then 15m), not the next 15m open. Each alert also gets a "📐 levels" Telegram message about
 10-20 s after the scanner's alert (rule_wide SL/TP, $ risk, scanner zone with a stale flag, open
 same-direction plans); TV_LEVELS_TELEGRAM=0 turns it off.
+
+Sizing: the levels message sizes each trade at TV_RISK_PCT (default 1%) of the futures wallet balance,
+read read-only from the crypto-risk-app Postgres (account.py, via docker exec psql in a READ ONLY
+transaction). Drawdown is transfer-adjusted (a withdrawal is not a loss); at TV_DRAWDOWN_HALVE_PCT below
+the 30-day peak the risk is halved. Your real open positions are listed against TV_MAX_OPEN /
+TV_MAX_SAME_DIRECTION. If the database is unreachable the last good balance is used, then TV_RISK_USD.
