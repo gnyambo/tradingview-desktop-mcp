@@ -21,6 +21,8 @@ LEVERAGE = float(os.environ.get("TV_LEVERAGE", "10"))
 MMR_PCT = float(os.environ.get("TV_MMR_PCT", "0.5"))                    # rough maintenance margin
 WARN_STOP_PCT = float(os.environ.get("TV_WARN_STOP_PCT", "5"))
 FEE_ROUNDTRIP_PCT = float(os.environ.get("TV_FEE_ROUNDTRIP_PCT", "0.10"))
+RISK_USD = float(os.environ.get("TV_RISK_USD", "50"))                  # $ lost at the stop, fees included
+LIQ_BUFFER = 1.5  # liquidation must sit at least this many stop-distances away
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}USDT$")
 WORD_RE = re.compile(r"^[A-Z_]{1,24}$")
@@ -170,6 +172,32 @@ def rr_text(entry, sl, tp1, tp2) -> str:
         return " / ".join(out) if out else "-"
     except (TypeError, ValueError, ZeroDivisionError):
         return "-"
+
+
+def safe_leverage(stop: float) -> int:
+    """Highest whole leverage (<= LEVERAGE) whose isolated-margin liquidation distance
+    (~100/lev - MMR %) is at least LIQ_BUFFER x the stop distance. Liquidation distance at a given
+    leverage does not depend on position size, so only leverage moves it."""
+    lev = int(min(LEVERAGE, 100 / (LIQ_BUFFER * stop + MMR_PCT)))
+    return max(1, lev)
+
+
+def sizing_lines(entry, sl) -> list[str]:
+    """Position size for a fixed $ risk (RISK_USD at the stop, round-trip fee included)."""
+    pct = stop_pct(entry, sl)
+    if not pct:
+        return []
+    notional = RISK_USD / ((pct + FEE_ROUNDTRIP_PCT) / 100)
+    lev = int(LEVERAGE)
+    lines = [f"Size for ${RISK_USD:.0f} risk (stop {pct:.1f}%): notional ${notional:,.0f} · "
+             f"margin ${notional / lev:,.0f} at {lev}x"]
+    safe = safe_leverage(pct)
+    if safe < lev:
+        liq = 100 / LEVERAGE - MMR_PCT
+        tag = "⛔" if pct >= liq else "⚠️"
+        lines.append(f"{tag} at {lev}x liquidation is ~{liq:.1f}% away, too close to a {pct:.1f}% stop: "
+                     f"use ≤{safe}x → margin ${notional / safe:,.0f}")
+    return lines
 
 
 def risk_text(entry, sl) -> str | None:
