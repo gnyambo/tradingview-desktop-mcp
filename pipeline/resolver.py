@@ -11,6 +11,8 @@ Legs (all on the same alert):
                   (STALE_LEVELS when price is already past the scanner's TP1)
 - rule_atr        no-analysis baseline: market, SL 1.5x / TP1 1.5x / TP2 3x 15m ATR
 - rule_wide       same with wide stops: SL 3x / TP1 3x / TP2 6x ATR (~2% stops, fees a small share of R)
+- step8_s0/s1/s2  Step-8 test plans only (kind "step8", see step8_test.py): the scanner's ACTIONABLE
+                  signal with three stop rules on the same signal
 
 Rules (agreed):
 - Same candle touches SL and a target -> SL counts (conservative).
@@ -32,6 +34,7 @@ import os
 import sys
 from pathlib import Path
 
+import step8_test
 from common import (LEG_FINAL, PLANS_DIR, add_hours, atr14, klines_15m_before, direction_from_bias, entry_series,
                     fmt_utc, from_ms, iter_plan_paths, klines_15m, load_json, parse_utc, plan_is_final, save_json,
                     to_ms, utcnow)
@@ -227,6 +230,8 @@ def replay(spec: dict, candles: list[dict]) -> dict:
 # ------------------------------------------------------------------ driver
 
 def leg_specs(plan: dict) -> dict:
+    if step8_test.is_step8(plan):
+        return step8_test.leg_specs(plan)  # S0/S1/S2 only
     specs = {}
     tv = plan.get("tv")
     if tv:

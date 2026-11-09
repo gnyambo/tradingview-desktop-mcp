@@ -12,9 +12,13 @@ import sqlite3
 import subprocess
 from datetime import timedelta
 
+import step8_test
 from common import PLANS_DIR, fmt_utc, iter_plan_paths, load_json, parse_utc, telegram_send, utcnow
 
 SCANNER_DB = os.environ.get("TV_SCANNER_DB", "/opt/binance-futures-scanner/scanner_history.db")
+SCANNER_SIGNALS = os.environ.get("TV_SCANNER_SIGNALS", "/opt/binance-futures-scanner/signals.json")
+# legs whose results the daily message reports (the /tv leg only exists when /tv runs)
+TRACKED_LEGS = (("step8_s0", "S0"), ("step8_s1", "S1"), ("step8_s2", "S2"), ("rule_wide", "rule wide"), ("tv", "/tv"))
 
 
 def minutes_ago(ts: str | None) -> float | None:
@@ -33,6 +37,36 @@ def safe_load(path):
         return load_json(path)
     except Exception:
         return {}
+
+
+def resolved_since(plans: list[dict], since) -> dict[str, dict[str, int]]:
+    """{leg label: {result: count}} for tracked legs that finished at/after `since`.
+    Result = TP1 / LOSS / TIMEOUT for entered trades, else the state (EXPIRED, CANCELLED, ...)."""
+    out: dict[str, dict[str, int]] = {}
+    for pl in plans:
+        legs = pl.get("legs") or {}
+        for name, label in TRACKED_LEGS:
+            leg = legs.get(name) or {}
+            closed = parse_utc(leg.get("closed_at")) if leg.get("closed_at") else None
+            if leg.get("final") and closed and closed >= since:
+                key = leg.get("result") or leg.get("state") or "?"
+                out.setdefault(label, {})
+                out[label][key] = out[label].get(key, 0) + 1
+    return out
+
+
+def resolved_text(res: dict[str, dict[str, int]]) -> str:
+    if not res:
+        return "none"
+    order = [label for _, label in TRACKED_LEGS if label in res]
+    return " · ".join(f"{label} " + ", ".join(f"{k} {v}" for k, v in sorted(res[label].items())) for label in order)
+
+
+def zone_watch_count() -> int | None:
+    try:
+        return int((load_json(SCANNER_SIGNALS).get("summary") or {}).get("zone_watch_active"))
+    except Exception:
+        return None
 
 
 def main():
@@ -97,34 +131,39 @@ def main():
         issues.append(f"disk free only {free_gb:.1f} GB")
 
     since = utcnow() - timedelta(hours=24)
-    alerts = runs = fails = live = 0
+    alerts = s8_signals = runs = fails = live = s8_live = 0
     cost = 0.0
-    resolved = {}
+    plans = []
     for p in iter_plan_paths():
         pl = safe_load(p)
+        plans.append(pl)
         created = parse_utc(pl.get("created_at_utc"))
         run = pl.get("run", {})
+        is_s8 = step8_test.is_step8(pl)
         if created and created >= since:
-            alerts += 1
+            if is_s8:
+                s8_signals += 1
+            else:
+                alerts += 1
             if run.get("ran"):
                 runs += 1
                 fails += bool(run.get("error"))
                 cost += run.get("cost_usd") or 0
         if not pl.get("final"):
             live += 1
-        leg = (pl.get("legs") or {}).get("tv") or {}
-        closed = parse_utc(leg.get("closed_at")) if leg.get("closed_at") else None
-        if leg.get("final") and closed and closed >= since:
-            key = leg.get("result") or leg.get("state")
-            resolved[key] = resolved.get(key, 0) + 1
+            s8_live += is_s8
 
-    res_txt = ", ".join(f"{k} {v}" for k, v in sorted(resolved.items())) or "none"
+    res_txt = resolved_text(resolved_since(plans, since))
+    watch = zone_watch_count()
+    watch_txt = f" · zone watch {watch}" if watch is not None else ""
+    runs_txt = f", /tv runs {runs} (failed {fails}), est. cost ${cost:.2f}" if runs else ""
     head = "🫀 tv-pipeline OK" if not issues else "🚨 tv-pipeline NEEDS ATTENTION"
     msg = (f"{head} · {fmt_utc(utcnow())} UTC\n"
            f"worker {worker_state}, polled {ago(tick_m)} · resolver ran {ago(res_m)} · "
            f"scanner wrote {ago(scan_m)}\n"
-           f"last 24h: alerts {alerts}, /tv runs {runs} (failed {fails}), est. cost ${cost:.2f}\n"
-           f"/tv plans resolved 24h: {res_txt} · live plans: {live} · disk free {free_gb:.0f} GB\n"
+           f"last 24h: Step-8 signals {s8_signals}, MTF alerts {alerts}{runs_txt}{watch_txt}\n"
+           f"resolved 24h: {res_txt}\n"
+           f"live plans: {live} (Step-8 {s8_live}) · disk free {free_gb:.0f} GB\n"
            f"{acct_txt}")
     if issues:
         msg += "\n\nIssues:\n- " + "\n- ".join(issues)

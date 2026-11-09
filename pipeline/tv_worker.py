@@ -17,6 +17,10 @@ plan file (scanner, scanner_market and rule legs), but no Claude, no TradingView
 "NEW" mirrors monitor_scanner_TELEGRAM.notify_changes(): a symbol MTF-qualified in a scan
 run that was not MTF-qualified in the previous scan run.
 
+Step-8 forward test (step8_test.py, TV_STEP8_TEST=0 turns it off): every NEW scanner ACTIONABLE
+signal gets its own plan file (<time>_<SYMBOL>_S8.json) tracked with three stop rules, and a
+"🧪 STEP-8 SIGNAL" Telegram message (TV_STEP8_TELEGRAM=0 turns the message off).
+
 Usage:
   python3 tv_worker.py              # run forever (systemd)
   python3 tv_worker.py --once       # process what's new, then exit
@@ -41,6 +45,7 @@ from common import (FEE_ROUNDTRIP_PCT, PLANS_DIR, RISK_USD, SYMBOL_RE, WORD_RE, 
                     safe_leverage, save_json, sizing_lines, stop_pct, telegram_send, utcnow)
 from account import get_account, positions_lines, risk_budget
 from resolver import RULE_WIDE_SL_ATR, RULE_WIDE_TP1_ATR, RULE_WIDE_TP2_ATR
+import step8_test
 
 SCANNER_DB = os.environ.get("TV_SCANNER_DB", "/opt/binance-futures-scanner/scanner_history.db")
 STATE_PATH = PLANS_DIR / ".worker_state.json"
@@ -150,6 +155,8 @@ def active_plan_for(symbol: str, bias: str) -> str | None:
         except Exception:
             continue
         src = pl.get("source", {})
+        if step8_test.is_step8(pl):
+            continue  # Step-8 test plans are deduplicated separately
         if src.get("symbol") != symbol or src.get("trade_bias") != bias or pl.get("final"):
             continue
         legs = pl.get("legs", {})
@@ -208,6 +215,8 @@ def open_same_direction(direction: str) -> list[str]:
         except Exception:
             continue
         src = pl.get("source") or {}
+        if step8_test.is_step8(pl):
+            continue
         if pl.get("final") or direction_from_bias(src.get("trade_bias")) != direction:
             continue
         created = parse_utc(pl.get("created_at_utc"))
@@ -233,7 +242,7 @@ def alert_levels(obs: dict, plan: dict) -> dict | None:
         acct, acct_problem = get_account()
         risk_usd, risk_pct, risk_label = risk_budget(acct)
         equity_txt = f" of ${acct['equity_usdt']:,.0f}" if acct else ""
-        lines = [f"📐 {symbol} {direction.upper()} · levels (forward test, not validated yet)",
+        lines = [f"📐 {symbol} {direction.upper()} · levels (this rule FAILED its forward test: reference only)",
                  f"Market ≈ {fmt_px(px)} · 15m ATR {fmt_px(atr)} ({atr / px * 100:.2f}%)",
                  f"SL {fmt_px(sl)} · TP1 {fmt_px(tp1)} (1R) · TP2 {fmt_px(tp2)} (2R)",
                  *sizing_lines(px, sl, risk_usd, (risk_label + equity_txt) if risk_usd else None)]
@@ -494,6 +503,46 @@ def process(obs: dict, st: dict, dry_run: bool) -> None:
         alert(st, f"/tv failed for {obs['symbol']}: {r['error']}")
 
 
+def process_step8(obs: dict, st: dict, dry_run: bool) -> None:
+    """A NEW scanner ACTIONABLE signal: save a Step-8 test plan (S0/S1/S2 legs) and message it."""
+    pid = step8_test.plan_id(obs)
+    path = PLANS_DIR / f"{pid}.json"
+    tag = f"STEP-8 {obs['symbol']} {obs['trade_bias']} (run {obs['scan_run_id']}, obs {obs['id']})"
+    bad = valid_obs(obs)
+    if bad:
+        log(f"skip {tag}: {bad}")
+        return
+    if path.exists():
+        log(f"skip {tag}: plan exists")
+        return
+    dup = step8_test.active_plan_for(obs["symbol"], obs["trade_bias"])
+    if dup:
+        log(f"skip {tag}: active step-8 plan {dup}")
+        return
+    plan = step8_test.build_plan(obs)
+    if dry_run:
+        log(f"NEW {tag}: {plan['step8']}")
+        return
+    save_json(path, plan)
+    log(f"saved step-8 test plan {pid}")
+    if not step8_test.TELEGRAM:
+        return
+    try:
+        acct, acct_problem = get_account()
+        risk_usd, _, risk_label = risk_budget(acct)
+        equity_txt = f" of ${acct['equity_usdt']:,.0f}" if acct else ""
+        extra = positions_lines(acct, plan["step8"]["direction"])
+        if acct_problem:
+            extra.insert(0, f"⚠️ {acct_problem}")
+        text = step8_test.message(plan, price_now(obs["symbol"]), risk_usd or RISK_USD,
+                                  (risk_label + equity_txt) if risk_usd else f"the fixed ${RISK_USD:.0f}",
+                                  extra)
+    except Exception as e:  # the plan is saved; a message problem must not lose it
+        log(f"step-8 message for {obs['symbol']} failed: {e}")
+        text = f"🧪 STEP-8 SIGNAL · {obs['symbol']} {obs['trade_bias']} (levels in the plan file)"
+    telegram_send(text)
+
+
 def tick(st: dict, dry_run: bool, since_run: int | None = None) -> None:
     con = db_connect()
     try:
@@ -518,6 +567,15 @@ def tick(st: dict, dry_run: bool, since_run: int | None = None) -> None:
                     log(f"error on {obs.get('symbol')}: {e}\n{traceback.format_exc()}")
                     if not dry_run:
                         alert(st, f"crash while processing {obs.get('symbol')}: {e}")
+            if step8_test.ENABLED:
+                for obs in step8_test.new_actionable_in_run(con, run_id):
+                    found += 1
+                    try:
+                        process_step8(obs, st, dry_run)
+                    except Exception as e:
+                        log(f"step-8 error on {obs.get('symbol')}: {e}\n{traceback.format_exc()}")
+                        if not dry_run:
+                            alert(st, f"crash while processing step-8 {obs.get('symbol')}: {e}")
             if not dry_run and since_run is None:
                 st["last_scan_run_id"] = run_id
                 save_state(st)
@@ -547,6 +605,7 @@ def main():
         sh("systemctl", "stop", "tradingview")
         log(f"tv-worker started (state: last scan run {st.get('last_scan_run_id')}, "
             f"/tv runs {'on' if RUN_CLAUDE else 'OFF'}, levels msg {'on' if LEVELS_TELEGRAM else 'OFF'}, "
+            f"step-8 test {'on' if step8_test.ENABLED else 'OFF'}, "
             f"poll {POLL_S}s, settle {SETTLE_S}s)")
     while True:
         try:

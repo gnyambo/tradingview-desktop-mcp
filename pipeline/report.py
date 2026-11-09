@@ -3,7 +3,10 @@
 Report: compares the /tv plans with the scanner's own levels on the same alerts,
 breaks /tv results down by grade and by rubric criterion, compares market entries,
 and scores the forward test (scanner @ market, fresh alerts only, vs the wide-stop rule).
-Usage: python3 report.py [--since YYYY-MM-DD] [--forward-from "YYYY-MM-DD HH:MM"]
+Also scores the Step-8 forward test (step8_test.py): the scanner's ACTIONABLE signals with three stop
+rules side by side.
+Usage: python3 report.py [--since YYYY-MM-DD] [--forward-from "YYYY-MM-DD HH:MM"] [--brief]
+       --brief prints only the forward-test sections (quick status).
 """
 import argparse
 import math
@@ -12,6 +15,7 @@ from collections import defaultdict
 
 from datetime import timedelta
 
+import step8_test
 from common import (FEE_ROUNDTRIP_PCT, NOTIONAL_USD, direction_from_bias, fmt_utc, iter_plan_paths,
                     load_json, parse_utc)
 
@@ -124,7 +128,8 @@ def mark_repeats(plans: list[dict]) -> int:
         if pl.get("tv"):
             continue
         src = pl.get("source") or {}
-        key, t = (src.get("symbol"), src.get("trade_bias")), pl.get("created_at_utc") or ""
+        key = (pl.get("kind"), src.get("symbol"), src.get("trade_bias"))  # Step-8 and MTF plans apart
+        t = pl.get("created_at_utc") or ""
         if t < end_by_key.get(key, ""):
             pl["_repeat"] = True
             n += 1
@@ -197,11 +202,43 @@ class Bucket:
                 f"avg {avg:>7} | total {tot:>7} | {usd:>18} | risk/trade {risk:>4} | not entered: {ne}")
 
 
+def step8_lines(plans: list[dict], start: str = step8_test.FROM) -> list[str]:
+    """Step-8 forward test: one Bucket per stop rule on the same signals, verdict per rule."""
+    buckets = {leg: Bucket() for leg in step8_test.LEGS}
+    longs = {leg: 0 for leg in step8_test.LEGS}
+    signals = via_watch = repeats = 0
+    for pl in plans:
+        if not step8_test.is_step8(pl) or (pl.get("created_at_utc") or "") < start:
+            continue
+        if pl.get("_repeat"):
+            repeats += 1
+            continue
+        signals += 1
+        s8 = pl.get("step8") or {}
+        via_watch += bool(s8.get("via_zone_watch"))
+        for leg in step8_test.LEGS:
+            lg = (pl.get("legs") or {}).get(leg)
+            buckets[leg].add(lg, s8.get(step8_test.SL_FIELD[leg]))
+            if lg and lg.get("result"):
+                longs[leg] += s8.get("direction") == "long"
+    out = [f"== STEP-8 FORWARD TEST from {start} UTC: scanner ACTIONABLE signals, 3 stop rules, same signals ==",
+           f"signals {signals} (found by the zone watch: {via_watch}; repeats left out: {repeats})"]
+    for leg in step8_test.LEGS:
+        out.append(buckets[leg].line(step8_test.LABELS[leg]))
+    for leg in step8_test.LEGS:
+        m, se = mean_se(buckets[leg].net_rs)
+        avg = f"{m:+.2f}R" + (f" ± {se:.2f}" if se is not None else "") if m is not None else "-"
+        out.append(f"VERDICT {step8_test.LABELS[leg]:<17} after fees {avg:<14} | "
+                   f"{verdict(buckets[leg].net_rs, longs[leg])}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", help="only plans created on/after this UTC date")
     ap.add_argument("--forward-from", default=FORWARD_FROM,
                     help=f"start of the forward test, UTC (default {FORWARD_FROM})")
+    ap.add_argument("--brief", action="store_true", help="forward-test sections only (quick status)")
     a = ap.parse_args()
 
     plans = []
@@ -228,6 +265,9 @@ def main():
     failed = capped = 0
     cost = 0.0
     repeats = mark_repeats(plans)
+    s8_plans = [pl for pl in plans if step8_test.is_step8(pl)]
+    plans = [pl for pl in plans if not step8_test.is_step8(pl)]  # MTF-alert plans below
+    repeats -= sum(1 for pl in s8_plans if pl.get("_repeat"))
     for pl in plans:
         legs = pl.get("legs", {})
         sp = pl.get("scanner_plan") or {}
@@ -285,8 +325,18 @@ def main():
         if b:
             tv_by_stop[b].add(legs.get("tv"), tsl)
 
+    if a.brief:
+        print("\n".join(step8_lines(s8_plans)))
+        m_pw, se_pw = mean_se(pw_wide.net_rs)
+        print(f"\n== earlier test (closed, FAILED 2026-11-09): Step-7 alert + rule wide @ market ==")
+        print(pw_wide.line("rule wide @ market"))
+        print(f"VERDICT (rule wide): {verdict(pw_wide.net_rs, pw_longs)}")
+        return
+
     print(f"Alerts: {len(plans)}  | /tv failed: {failed} | skipped by cap: {capped} | "
           f"est. Claude cost: ${cost:.2f}\n")
+    print("\n".join(step8_lines(s8_plans)))
+    print()
     print("== /tv vs scanner (same alerts) ==")
     print(tv_all.line("/tv"))
     print(tv_mkt.line("/tv @ market"))
@@ -356,6 +406,9 @@ def main():
           "risk/trade = average $ lost if a trade hits its stop.")
     print("not entered: missed = TP1 reached before entry (direction right, entry too far); "
           "invalidated = cancel level hit first; stale_levels = already past TP1 when issued.")
+    print("Step-8 test: S0 = scanner limit + scanner stop; S1 = same limit, stop zone + 0.5x zone-timeframe ATR; "
+          "S2 = market at the signal, stop beyond the 4h sweep extreme + 0.25x 15m ATR. "
+          f"Pass per rule: {FORWARD_N} resolved, >= {FORWARD_MIN_R:+.2f}R after fees, >= {FORWARD_MIN_LONGS} longs.")
     print("win = TP1 before SL, among entered trades. R uses TP1 as the result "
           "(a trade that hit TP1 counts even while TP2 is still open). "
           "Small samples: treat differences under ~30 trades per row as noise.")
