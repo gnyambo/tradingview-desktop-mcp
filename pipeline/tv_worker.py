@@ -242,7 +242,7 @@ def alert_levels(obs: dict, plan: dict) -> dict | None:
         acct, acct_problem = get_account()
         risk_usd, risk_pct, risk_label = risk_budget(acct)
         equity_txt = f" of ${acct['equity_usdt']:,.0f}" if acct else ""
-        lines = [f"📐 {symbol} {direction.upper()} · levels (this rule FAILED its forward test: reference only)",
+        lines = [f"📐 {symbol} {direction.upper()} · levels (rule wide failed test 1, test 2 running: reference only)",
                  f"Market ≈ {fmt_px(px)} · 15m ATR {fmt_px(atr)} ({atr / px * 100:.2f}%)",
                  f"SL {fmt_px(sl)} · TP1 {fmt_px(tp1)} (1R) · TP2 {fmt_px(tp2)} (2R)",
                  *sizing_lines(px, sl, risk_usd, (risk_label + equity_txt) if risk_usd else None)]
@@ -503,11 +503,13 @@ def process(obs: dict, st: dict, dry_run: bool) -> None:
         alert(st, f"/tv failed for {obs['symbol']}: {r['error']}")
 
 
-def process_step8(obs: dict, st: dict, dry_run: bool) -> None:
-    """A NEW scanner ACTIONABLE signal: save a Step-8 test plan (S0/S1/S2 legs) and message it."""
-    pid = step8_test.plan_id(obs)
+def process_step8(obs: dict, st: dict, dry_run: bool, shadow: bool = False) -> None:
+    """A NEW scanner ACTIONABLE signal: save a Step-8 test plan (S0/S1/S2 legs) and message it.
+    shadow=True: a complete sequence rejected only by volume and/or RR; same legs, saved silently."""
+    pid = step8_test.plan_id(obs, shadow)
     path = PLANS_DIR / f"{pid}.json"
-    tag = f"STEP-8 {obs['symbol']} {obs['trade_bias']} (run {obs['scan_run_id']}, obs {obs['id']})"
+    tag = (f"STEP-8{' SHADOW' if shadow else ''} {obs['symbol']} {obs['trade_bias']} "
+           f"(run {obs['scan_run_id']}, obs {obs['id']})")
     bad = valid_obs(obs)
     if bad:
         log(f"skip {tag}: {bad}")
@@ -515,17 +517,18 @@ def process_step8(obs: dict, st: dict, dry_run: bool) -> None:
     if path.exists():
         log(f"skip {tag}: plan exists")
         return
-    dup = step8_test.active_plan_for(obs["symbol"], obs["trade_bias"])
+    # a shadow is skipped while ANY step-8 plan for this move is running; a real signal only by a real one
+    dup = step8_test.active_plan_for(obs["symbol"], obs["trade_bias"], shadow=None if shadow else False)
     if dup:
         log(f"skip {tag}: active step-8 plan {dup}")
         return
-    plan = step8_test.build_plan(obs)
+    plan = step8_test.build_plan(obs, shadow)
     if dry_run:
         log(f"NEW {tag}: {plan['step8']}")
         return
     save_json(path, plan)
-    log(f"saved step-8 test plan {pid}")
-    if not step8_test.TELEGRAM:
+    log(f"saved step-8 {'shadow' if shadow else 'test'} plan {pid}")
+    if shadow or not step8_test.TELEGRAM:
         return
     try:
         acct, acct_problem = get_account()
@@ -576,6 +579,12 @@ def tick(st: dict, dry_run: bool, since_run: int | None = None) -> None:
                         log(f"step-8 error on {obs.get('symbol')}: {e}\n{traceback.format_exc()}")
                         if not dry_run:
                             alert(st, f"crash while processing step-8 {obs.get('symbol')}: {e}")
+                for obs in step8_test.new_shadow_in_run(con, run_id):
+                    found += 1
+                    try:
+                        process_step8(obs, st, dry_run, shadow=True)
+                    except Exception as e:
+                        log(f"step-8 shadow error on {obs.get('symbol')}: {e}\n{traceback.format_exc()}")
             if not dry_run and since_run is None:
                 st["last_scan_run_id"] = run_id
                 save_state(st)

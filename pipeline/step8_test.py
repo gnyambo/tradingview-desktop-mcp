@@ -13,7 +13,14 @@ All three target the scanner's TP1/TP2. Limits are valid 24h (same as the scanne
 out 72h after entry (resolver). Pass mark per rule, same as before: FORWARD_N resolved trades,
 >= FORWARD_MIN_R after fees, >= FORWARD_MIN_LONGS longs.
 
-Pure functions except new_actionable_in_run (scanner db, read-only) and plan bookkeeping on disk.
+Shadow group (from 2026-11-14, information only): a complete Step-8 sequence that the scanner rejected
+ONLY for the 15m volume trigger and/or the RR minimum (scanner field shadow_sequence). Same three
+legs, plan id ..._S8X, plan["shadow"] = True, no Telegram message. It exists to measure whether those
+two gates remove losers or winners; it has no pass mark and can never become a tradeable rule without
+a fresh test of its own.
+
+Pure functions except new_actionable_in_run / new_shadow_in_run (scanner db, read-only) and plan
+bookkeeping on disk.
 """
 import json
 import os
@@ -52,9 +59,36 @@ def new_actionable_in_run(con, run_id: int) -> list[dict]:
     return [dict(r) for r in rows if r["symbol"] not in prev_syms]
 
 
-def plan_id(obs: dict) -> str:
+SHADOW_MARK = '"shadow_sequence": true'  # as json.dumps writes it in raw_record_json
+
+
+def _is_shadow_row(raw: str | None) -> bool:
+    if not raw or SHADOW_MARK not in raw:
+        return False
+    try:
+        return json.loads(raw).get("shadow_sequence") is True
+    except ValueError:
+        return False
+
+
+def new_shadow_in_run(con, run_id: int) -> list[dict]:
+    """Symbols flagged shadow_sequence in this scan run that were not flagged in the previous run."""
+    prev = con.execute("SELECT MAX(scan_run_id) FROM symbol_observations WHERE scan_run_id < ?",
+                       (run_id,)).fetchone()[0]
+    like = f"%{SHADOW_MARK}%"
+    prev_syms = set()
+    if prev is not None:
+        prev_syms = {r[0] for r in con.execute(
+            "SELECT symbol, raw_record_json FROM symbol_observations WHERE scan_run_id = ? AND raw_record_json LIKE ?",
+            (prev, like)) if _is_shadow_row(r[1])}
+    rows = con.execute(f"SELECT {OBS_FIELDS} FROM symbol_observations "
+                       "WHERE scan_run_id = ? AND raw_record_json LIKE ? ORDER BY symbol", (run_id, like))
+    return [dict(r) for r in rows if _is_shadow_row(r["raw_record_json"]) and r["symbol"] not in prev_syms]
+
+
+def plan_id(obs: dict, shadow: bool = False) -> str:
     t = parse_utc(obs["observed_at"])
-    return f"{t.strftime('%Y%m%dT%H%MZ')}_{obs['symbol']}_S8"
+    return f"{t.strftime('%Y%m%dT%H%MZ')}_{obs['symbol']}_S8" + ("X" if shadow else "")
 
 
 def _num(x):
@@ -64,15 +98,17 @@ def _num(x):
         return None
 
 
-def build_plan(obs: dict) -> dict:
+def build_plan(obs: dict, shadow: bool = False) -> dict:
     try:
         rec = json.loads(obs.get("raw_record_json") or "{}")
     except ValueError:
         rec = {}
     rec = rec if isinstance(rec, dict) else {}
     return {
-        "id": plan_id(obs),
+        "id": plan_id(obs, shadow),
         "kind": KIND,
+        "shadow": shadow,
+        "shadow_blockers": list(rec.get("shadow_blockers") or []) if shadow else [],
         "created_at_utc": fmt_utc(utcnow()),
         "source": {k: obs.get(k) for k in SOURCE_KEYS},
         "step8": {
@@ -96,8 +132,14 @@ def build_plan(obs: dict) -> dict:
     }
 
 
-def active_plan_for(symbol: str, bias: str, plans: list[dict] | None = None) -> str | None:
-    """A Step-8 plan for the same symbol+bias that is still running -> skip, one move counted once."""
+def is_shadow(plan: dict) -> bool:
+    return bool(plan.get("shadow"))
+
+
+def active_plan_for(symbol: str, bias: str, plans: list[dict] | None = None,
+                    shadow: bool | None = False) -> str | None:
+    """A Step-8 plan for the same symbol+bias that is still running -> skip, one move counted once.
+    shadow=False looks at real signals only, True at shadows only, None at both."""
     if plans is None:
         plans = []
         for p in iter_plan_paths():
@@ -108,6 +150,8 @@ def active_plan_for(symbol: str, bias: str, plans: list[dict] | None = None) -> 
     for pl in plans:
         src = pl.get("source") or {}
         if pl.get("kind") != KIND or pl.get("final"):
+            continue
+        if shadow is not None and is_shadow(pl) != shadow:
             continue
         if src.get("symbol") != symbol or src.get("trade_bias") != bias:
             continue

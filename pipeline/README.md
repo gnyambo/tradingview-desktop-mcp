@@ -38,6 +38,18 @@ PASS per rule after 30 resolved trades: >= +0.10R after fees and >= 5 longs. Qui
     python3 report.py --brief
 TV_STEP8_TEST=0 stops new Step-8 plans; TV_STEP8_TELEGRAM=0 stops the "🧪 STEP-8 SIGNAL" message.
 
+Shadow group (from 2026-11-14, information only, no pass mark): complete Step-8 sequences the scanner
+rejected ONLY for the 15m volume trigger and/or the RR minimum (scanner field shadow_sequence) are saved
+silently as `<time>_<SYMBOL>_S8X.json` with the same three legs, to measure whether those two gates
+remove losers or winners. It cannot become a tradeable rule without a fresh test of its own.
+
+Rule wide @ market (Step-7 alert, market entry, 3x ATR stop, 1R target):
+  Test 1 (2026-10-26 to 2026-11-09) FAILED at its 30-trade mark: +0.01R ± 0.16 after fees. Its result is
+    frozen in the report; the running average crossing the mark afterwards is optional stopping.
+  Test 2 from 2026-11-14 10:00 UTC, registered before its trades existed: PASS = the FIRST 60 resolved
+    trades average >= +0.10R after fees with >= 10 longs. Trades between the two tests are shown but
+    count in neither. Verdicts are judged on the first N resolved trades only and never move afterwards.
+
 Earlier forward test (fixed 2026-10-25, after /tv failed its 0.2R checkpoint on 50 trades; rule_wide FAILED 2026-11-09):
 alerts from 2026-10-26 00:00 UTC, scanner direction + market entry + the scanner's own SL/TP,
 skipping alerts already past the scanner's TP1 ("stale"). PASS after 30 resolved fresh trades if

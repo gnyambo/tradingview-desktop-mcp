@@ -186,5 +186,105 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("Found by the zone watch", text)
 
 
+def shadow_obs(**kw):
+    o = obs(**kw)
+    raw = json.loads(o["raw_record_json"])
+    raw.update(shadow_sequence=True, shadow_blockers=["volume"])
+    return dict(o, primary_state="WAITING", raw_record_json=json.dumps(raw))
+
+
+class ShadowTests(unittest.TestCase):
+    def setUp(self):
+        for p in Path(_TMP).glob("*.json"):
+            p.unlink()
+
+    def test_only_new_shadows(self):
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        cols = step8_test.OBS_FIELDS
+        con.execute(f"CREATE TABLE symbol_observations ({cols})")
+        rows = (shadow_obs(symbol="AUSDT", run=1, oid=1), shadow_obs(symbol="AUSDT", run=2, oid=2),
+                shadow_obs(symbol="BUSDT", run=2, oid=3), dict(obs("CUSDT", run=2, oid=4), primary_state="WAITING"))
+        for o in rows:
+            con.execute(f"INSERT INTO symbol_observations ({cols}) VALUES ({','.join('?' * len(o))})",
+                        [o[k.strip()] for k in cols.split(",")])
+        self.assertEqual([r["symbol"] for r in step8_test.new_shadow_in_run(con, 1)], ["AUSDT"])
+        self.assertEqual([r["symbol"] for r in step8_test.new_shadow_in_run(con, 2)], ["BUSDT"])   # A repeats, C is not one
+        self.assertEqual(step8_test.new_actionable_in_run(con, 2), [])
+
+    def test_shadow_plan_fields(self):
+        pl = step8_test.build_plan(shadow_obs(), shadow=True)
+        self.assertTrue(pl["id"].endswith("_XRPUSDT_S8X"))
+        self.assertEqual((pl["kind"], pl["shadow"], pl["shadow_blockers"]), ("step8", True, ["volume"]))
+        self.assertEqual(set(resolver.leg_specs(pl)), set(step8_test.LEGS))
+        real = step8_test.build_plan(obs())
+        self.assertEqual((real["shadow"], real["shadow_blockers"]), (False, []))
+
+    def test_shadow_is_silent_and_never_blocks_a_real_signal(self):
+        sent = []
+        with mock.patch.object(tv_worker, "telegram_send", side_effect=lambda t: sent.append(t) or True), \
+                mock.patch.object(tv_worker, "get_account", return_value=(None, None)), \
+                mock.patch.object(tv_worker, "price_now", return_value=3.95):
+            tv_worker.process_step8(shadow_obs(), {}, dry_run=False, shadow=True)
+            self.assertEqual((len(list(Path(_TMP).glob("*_S8X.json"))), sent), (1, []))
+            tv_worker.process_step8(obs(at="2026-11-09T10:15:05+00:00"), {}, dry_run=False)        # real signal later
+            self.assertEqual((len(list(Path(_TMP).glob("*_S8.json"))), len(sent)), (1, 1))
+            tv_worker.process_step8(shadow_obs(at="2026-11-09T10:30:05+00:00"), {}, dry_run=False, shadow=True)
+        self.assertEqual(len(list(Path(_TMP).glob("*_S8X.json"))), 1)                             # a plan is already running
+
+    def test_report_keeps_the_groups_apart(self):
+        real = step8_test.build_plan(obs())
+        real.update(created_at_utc="2026-11-14 10:00", final=True,
+                    legs={"step8_s0": done_leg("TP1", 2.0), "step8_s1": done_leg("TP1", 1.0), "step8_s2": done_leg("TP1", 1.0)})
+        sh = step8_test.build_plan(shadow_obs(at="2026-11-14T11:00:05+00:00"), shadow=True)
+        sh.update(created_at_utc="2026-11-14 11:00", final=True,
+                  legs={"step8_s0": done_leg("LOSS", -1.0), "step8_s1": done_leg("LOSS", -1.0), "step8_s2": done_leg("LOSS", -1.0)})
+        self.assertEqual(report.mark_repeats([real, sh]), 0)
+        main, shadow = "\n".join(report.step8_lines([real, sh])), "\n".join(report.step8_lines([real, sh], shadow=True))
+        self.assertIn("signals 1 ", main)
+        self.assertIn("TP1   1 SL   0", main)
+        self.assertIn("setups 1 (rejected for: volume 1", shadow)
+        self.assertIn("TP1   0 SL   1", shadow)
+        self.assertNotIn("VERDICT", shadow)
+        self.assertEqual(heartbeat.resolved_text(heartbeat.resolved_since([real, sh], common.parse_utc("2026-11-09 00:00"))),
+                         "S0 TP1 1 · S1 TP1 1 · S2 TP1 1 · shadow S0 LOSS 1 · shadow S1 LOSS 1 · shadow S2 LOSS 1")
+
+
+def wide_plan(created, result, r, direction="bearish", closed=None):
+    leg = dict(done_leg(result, r, fill=100.0, closed=closed or created), levels={"sl": 102.0 if direction == "bearish" else 98.0})
+    return {"created_at_utc": created, "source": {"symbol": f"S{created}", "trade_bias": direction}, "legs": {"rule_wide": leg}}
+
+
+class RuleWideTests(unittest.TestCase):
+    def test_test1_frozen_between_not_counted_test2_counts(self):
+        plans = [wide_plan("2026-11-01 10:00", "TP1", 1.0),            # test 1: frozen text, not recomputed
+                 wide_plan("2026-11-10 10:00", "TP1", 1.0),            # between the tests
+                 wide_plan("2026-11-12 10:00", "TP1", 1.0),
+                 wide_plan("2026-11-14 12:00", "LOSS", -1.0),          # test 2
+                 wide_plan("2026-11-15 12:00", "TP1", 1.0, "bullish")]
+        text = "\n".join(report.rule_wide_lines(plans))
+        self.assertIn("Test 1 (2026-10-26 to 2026-11-09): FAILED at its 30-trade mark", text)
+        self.assertRegex(text, r"between tests\s+plans\s+2 .*TP1\s+2 SL\s+0.*not counted")
+        self.assertIn("alerts 2 ", text)
+        self.assertRegex(text, r"rule wide, test 2\s+plans\s+2 .*TP1\s+1 SL\s+1")
+        self.assertIn("VERDICT (rule wide, test 2): not yet - 2/60 resolved trades, 1/10 longs", text)
+
+    def test_verdict_is_judged_on_the_first_n_only(self):
+        early = [-1.0] * 6 + [1.0] * 4                 # first 10: -0.2R
+        late = [1.0] * 30                               # a later winning run cannot rescue it
+        self.assertTrue(report.verdict(early + late, 12, n_required=10, min_longs=10).startswith("FAIL - avg -0.200R"))
+        self.assertTrue(report.verdict([1.0] * 10 + [-1.0] * 30, 12, n_required=10, min_longs=10).startswith("PASS"))
+        self.assertIn("only 3 longs", report.verdict([1.0] * 10, 3, n_required=10, min_longs=10))
+        self.assertEqual(report.verdict([1.0] * 9, 3, n_required=10, min_longs=10), "not yet - 9/10 resolved trades, 3/10 longs")
+
+    def test_test2_orders_trades_by_when_they_resolved(self):
+        plans = [wide_plan("2026-11-14 12:00", "TP1", 1.0, closed="2026-11-16 09:00"),     # created first, resolved last
+                 wide_plan("2026-11-14 13:00", "LOSS", -1.0, closed="2026-11-14 14:00"),
+                 wide_plan("2026-11-14 14:00", "LOSS", -1.0, closed="2026-11-14 15:00")]
+        with mock.patch.object(report, "TEST2_N", 2), mock.patch.object(report, "TEST2_MIN_LONGS", 0):
+            text = "\n".join(report.rule_wide_lines(plans))
+        self.assertIn("VERDICT (rule wide, test 2): FAIL - avg -1.", text)                 # the two losses came first
+
+
 if __name__ == "__main__":
     unittest.main()

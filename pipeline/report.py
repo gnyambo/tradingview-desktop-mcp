@@ -38,6 +38,19 @@ FORWARD_N = 30
 FORWARD_MIN_R = 0.10
 FORWARD_MIN_LONGS = 5
 
+# Rule wide @ market (Step-7 alert, market entry, 3x ATR stop, 1R target).
+# Test 1 was judged at its pre-registered 30-trade mark on 2026-11-09 and FAILED. Its result is frozen
+# here as it stood at the verdict: the same alerts kept resolving afterwards and the running average
+# later crossed the pass mark, which is optional stopping, not a pass.
+# Test 2 was registered on 2026-11-14, before any of its trades existed, with a longer sample and more
+# longs so that one falling market cannot pass it on its own.
+TEST1_END = "2026-11-09 09:00"
+TEST1_RESULT = ("FAILED at its 30-trade mark (2026-11-09): 36 entered, 19 TP1 / 16 SL / 1 timeout, "
+                "+0.01R ± 0.16 after fees. Closed.")
+TEST2_FROM = os.environ.get("TV_RULE_WIDE_TEST2_FROM", "2026-11-14 10:00")
+TEST2_N = 60
+TEST2_MIN_LONGS = 10
+
 CRITERIA = ("d1_alignment", "h4_alignment", "location", "confirmation_15m", "rr_tp1", "stop_quality")
 
 
@@ -71,20 +84,22 @@ def net_r(leg: dict, sl) -> float | None:
         return None
 
 
-def verdict(net_rs: list[float], longs: int, rival: float | None = None, rival_name: str = "") -> str:
-    """The pre-registered pass mark, applied to after-fee R of resolved trades."""
+def verdict(net_rs: list[float], longs: int, rival: float | None = None, rival_name: str = "",
+            n_required: int = FORWARD_N, min_longs: int = FORWARD_MIN_LONGS) -> str:
+    """The pre-registered pass mark, applied to after-fee R of resolved trades. Judged on the FIRST
+    n_required resolved trades only (in the order given): trades after the mark never change it."""
     n = len(net_rs)
-    if n < FORWARD_N:
-        return f"not yet - {n}/{FORWARD_N} resolved trades, {longs}/{FORWARD_MIN_LONGS} longs"
-    m, _ = mean_se(net_rs)
+    if n < n_required:
+        return f"not yet - {n}/{n_required} resolved trades, {longs}/{min_longs} longs"
+    m, _ = mean_se(net_rs[:n_required])
     fails = []
     if m < FORWARD_MIN_R:
-        fails.append(f"avg {m:+.2f}R < {FORWARD_MIN_R:+.2f}R")
+        fails.append(f"avg {m:+.3f}R < {FORWARD_MIN_R:+.2f}R")
     if rival is not None and m <= rival:
         fails.append(f"does not beat {rival_name}")
-    if longs < FORWARD_MIN_LONGS:
-        fails.append(f"only {longs} longs (< {FORWARD_MIN_LONGS}): one-sided market")
-    return "PASS" if not fails else "FAIL - " + "; ".join(fails)
+    if longs < min_longs:
+        fails.append(f"only {longs} longs (< {min_longs}): one-sided market")
+    return (f"PASS (avg {m:+.3f}R on the first {n_required})" if not fails else "FAIL - " + "; ".join(fails))
 
 
 def exposure(intervals: list[tuple[str, str, str]]) -> tuple[int, int]:
@@ -128,7 +143,7 @@ def mark_repeats(plans: list[dict]) -> int:
         if pl.get("tv"):
             continue
         src = pl.get("source") or {}
-        key = (pl.get("kind"), src.get("symbol"), src.get("trade_bias"))  # Step-8 and MTF plans apart
+        key = (pl.get("kind"), bool(pl.get("shadow")), src.get("symbol"), src.get("trade_bias"))  # groups apart
         t = pl.get("created_at_utc") or ""
         if t < end_by_key.get(key, ""):
             pl["_repeat"] = True
@@ -202,13 +217,17 @@ class Bucket:
                 f"avg {avg:>7} | total {tot:>7} | {usd:>18} | risk/trade {risk:>4} | not entered: {ne}")
 
 
-def step8_lines(plans: list[dict], start: str = step8_test.FROM) -> list[str]:
-    """Step-8 forward test: one Bucket per stop rule on the same signals, verdict per rule."""
+def step8_lines(plans: list[dict], start: str = step8_test.FROM, shadow: bool = False) -> list[str]:
+    """Step-8 forward test: one Bucket per stop rule on the same signals, verdict per rule.
+    shadow=True: the information-only group of setups rejected only by volume and/or RR (no verdict)."""
     buckets = {leg: Bucket() for leg in step8_test.LEGS}
     longs = {leg: 0 for leg in step8_test.LEGS}
     signals = via_watch = repeats = 0
+    blockers: dict[str, int] = defaultdict(int)
     for pl in plans:
         if not step8_test.is_step8(pl) or (pl.get("created_at_utc") or "") < start:
+            continue
+        if step8_test.is_shadow(pl) != shadow:
             continue
         if pl.get("_repeat"):
             repeats += 1
@@ -216,20 +235,66 @@ def step8_lines(plans: list[dict], start: str = step8_test.FROM) -> list[str]:
         signals += 1
         s8 = pl.get("step8") or {}
         via_watch += bool(s8.get("via_zone_watch"))
+        blockers[" + ".join(pl.get("shadow_blockers") or []) or "?"] += 1
         for leg in step8_test.LEGS:
             lg = (pl.get("legs") or {}).get(leg)
             buckets[leg].add(lg, s8.get(step8_test.SL_FIELD[leg]))
             if lg and lg.get("result"):
                 longs[leg] += s8.get("direction") == "long"
-    out = [f"== STEP-8 FORWARD TEST from {start} UTC: scanner ACTIONABLE signals, 3 stop rules, same signals ==",
-           f"signals {signals} (found by the zone watch: {via_watch}; repeats left out: {repeats})"]
+    if shadow:
+        why = ", ".join(f"{k} {v}" for k, v in sorted(blockers.items())) or "-"
+        out = ["== STEP-8 SHADOW GROUP (information only, no verdict): complete setups the scanner rejected "
+               "only for volume and/or RR ==",
+               f"setups {signals} (rejected for: {why}; repeats left out: {repeats})"]
+    else:
+        out = [f"== STEP-8 FORWARD TEST from {start} UTC: scanner ACTIONABLE signals, 3 stop rules, same signals ==",
+               f"signals {signals} (found by the zone watch: {via_watch}; repeats left out: {repeats})"]
     for leg in step8_test.LEGS:
         out.append(buckets[leg].line(step8_test.LABELS[leg]))
     for leg in step8_test.LEGS:
         m, se = mean_se(buckets[leg].net_rs)
         avg = f"{m:+.2f}R" + (f" ± {se:.2f}" if se is not None else "") if m is not None else "-"
-        out.append(f"VERDICT {step8_test.LABELS[leg]:<17} after fees {avg:<14} | "
-                   f"{verdict(buckets[leg].net_rs, longs[leg])}")
+        tail = (f"{len(buckets[leg].net_rs)} resolved" if shadow else verdict(buckets[leg].net_rs, longs[leg]))
+        out.append(f"{'after fees' if shadow else 'VERDICT'} {step8_test.LABELS[leg]:<17} "
+                   f"{'' if shadow else 'after fees '}{avg:<14} | {tail}")
+    return out
+
+
+def rule_wide_lines(plans: list[dict]) -> list[str]:
+    """Rule wide @ market: test 1 frozen at its verdict, the uncounted trades between the tests, test 2."""
+    between, t2 = Bucket(), Bucket()
+    t2_longs, t2_alerts, t2_intervals, t2_rows = 0, 0, [], []
+    for pl in plans:
+        created = pl.get("created_at_utc") or ""
+        if step8_test.is_step8(pl) or pl.get("_repeat") or created < TEST1_END:
+            continue
+        leg = (pl.get("legs") or {}).get("rule_wide")
+        if created < TEST2_FROM:
+            between.add(leg)
+            continue
+        t2_alerts += 1
+        t2.add(leg)
+        direction = direction_from_bias((pl.get("source") or {}).get("trade_bias"))
+        if leg and leg.get("filled_at"):
+            t2_intervals.append((leg["filled_at"], leg.get("closed_at") or "9999-12-31 00:00", direction))
+        if leg and leg.get("result") and leg.get("r") is not None:
+            t2_longs += direction == "long"
+            t2_rows.append((leg.get("closed_at") or "", net_r(leg, (leg.get("levels") or {}).get("sl"))))
+    ordered = [r for _, r in sorted(t2_rows, key=lambda x: x[0]) if r is not None]  # the order trades resolved in
+    m, se = mean_se(ordered)
+    peak, clusters = exposure(t2_intervals)
+    out = ["== RULE WIDE @ market: Step-7 alert, market entry, 3x ATR stop, 1R target ==",
+           f"Test 1 (2026-10-26 to 2026-11-09): {TEST1_RESULT}",
+           between.line("between tests") + "  <- not counted in either test",
+           f"Test 2 from {TEST2_FROM} UTC (registered before its trades): pass = first {TEST2_N} resolved trades "
+           f">= {FORWARD_MIN_R:+.2f}R after fees, >= {TEST2_MIN_LONGS} longs",
+           f"alerts {t2_alerts} (repeats of a move already counted left out)",
+           t2.line("rule wide, test 2")]
+    if m is not None:
+        out.append(f"after fees: {m:+.3f}R" + (f" ± {se:.2f}" if se is not None else "") +
+                   f" per trade | longs resolved {t2_longs} | up to {peak} same-direction positions open at once, "
+                   f"{clusters} hours with 2+ same-direction entries")
+    out.append(f"VERDICT (rule wide, test 2): {verdict(ordered, t2_longs, n_required=TEST2_N, min_longs=TEST2_MIN_LONGS)}")
     return out
 
 
@@ -260,8 +325,6 @@ def main():
     sc_mkt_all, wide_all, mk_lim, mk_rule = Bucket(), Bucket(), Bucket(), Bucket()  # market-entry table
     fw_sc, fw_wide, fw_rule = Bucket(), Bucket(), Bucket()  # forward test: fresh alerts only
     fw_alerts = fw_stale = fw_longs = 0
-    pw_wide, pw_rule = Bucket(), Bucket()  # primary forward test: rule_wide on all alerts
-    pw_longs, pw_intervals = 0, []
     failed = capped = 0
     cost = 0.0
     repeats = mark_repeats(plans)
@@ -283,14 +346,6 @@ def main():
             mk_rule.add(legs.get("rule_atr"))
         if (pl.get("created_at_utc") or "") >= a.forward_from and not pl.get("_repeat"):
             fw_alerts += 1
-            wleg = legs.get("rule_wide")
-            pw_wide.add(wleg)
-            pw_rule.add(legs.get("rule_atr"))
-            pdir = direction_from_bias((pl.get("source") or {}).get("trade_bias"))
-            if wleg and wleg.get("result"):
-                pw_longs += pdir == "long"
-            if wleg and wleg.get("filled_at"):
-                pw_intervals.append((wleg["filled_at"], wleg.get("closed_at") or "9999-12-31 00:00", pdir))
             if smk and smk.get("state") == "STALE_LEVELS":
                 fw_stale += 1
             elif smk and smk.get("fill_price") is not None:
@@ -327,15 +382,19 @@ def main():
 
     if a.brief:
         print("\n".join(step8_lines(s8_plans)))
-        m_pw, se_pw = mean_se(pw_wide.net_rs)
-        print(f"\n== earlier test (closed, FAILED 2026-11-09): Step-7 alert + rule wide @ market ==")
-        print(pw_wide.line("rule wide @ market"))
-        print(f"VERDICT (rule wide): {verdict(pw_wide.net_rs, pw_longs)}")
+        print()
+        print("\n".join(step8_lines(s8_plans, shadow=True)))
+        print()
+        print("\n".join(rule_wide_lines(plans)))
         return
 
     print(f"Alerts: {len(plans)}  | /tv failed: {failed} | skipped by cap: {capped} | "
           f"est. Claude cost: ${cost:.2f}\n")
     print("\n".join(step8_lines(s8_plans)))
+    print()
+    print("\n".join(step8_lines(s8_plans, shadow=True)))
+    print()
+    print("\n".join(rule_wide_lines(plans)))
     print()
     print("== /tv vs scanner (same alerts) ==")
     print(tv_all.line("/tv"))
@@ -365,20 +424,6 @@ def main():
     print(sc_mkt_all.line("scanner @ market"))
     print(wide_all.line("rule wide @ market"))
     print(mk_rule.line("rule @ market"))
-
-    print(f"\n== FORWARD TEST (PRIMARY) from {a.forward_from} UTC: Step-7 alert, market entry, "
-          f"rule wide stops, all alerts ==")
-    print(f"alerts {fw_alerts} (repeats of a move already counted left out)")
-    print(pw_wide.line("rule wide @ market"))
-    print(pw_rule.line("rule (tight, ref)"))
-    m_pw, se_pw = mean_se(pw_wide.net_rs)
-    if m_pw is not None:
-        se_txt = f" ± {se_pw:.2f}" if se_pw is not None else ""
-        print(f"after fees: rule wide {m_pw:+.2f}R{se_txt} per trade | longs resolved {pw_longs}")
-    peak, clusters = exposure(pw_intervals)
-    print(f"correlation: up to {peak} same-direction positions open at once | "
-          f"{clusters} hours with 2+ same-direction entries")
-    print(f"VERDICT (rule wide): {verdict(pw_wide.net_rs, pw_longs)}")
 
     print(f"\n== scanner @ market, fresh alerts only (INFORMATION ONLY: Step-8 levels) ==")
     print(f"alerts {fw_alerts} | stale (skipped) {fw_stale} | fresh entered {fw_sc.entered + fw_sc.live}")

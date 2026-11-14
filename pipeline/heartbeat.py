@@ -46,6 +46,8 @@ def resolved_since(plans: list[dict], since) -> dict[str, dict[str, int]]:
     for pl in plans:
         legs = pl.get("legs") or {}
         for name, label in TRACKED_LEGS:
+            if step8_test.is_shadow(pl):
+                label = f"shadow {label}"
             leg = legs.get(name) or {}
             closed = parse_utc(leg.get("closed_at")) if leg.get("closed_at") else None
             if leg.get("final") and closed and closed >= since:
@@ -58,7 +60,8 @@ def resolved_since(plans: list[dict], since) -> dict[str, dict[str, int]]:
 def resolved_text(res: dict[str, dict[str, int]]) -> str:
     if not res:
         return "none"
-    order = [label for _, label in TRACKED_LEGS if label in res]
+    names = [label for _, label in TRACKED_LEGS]
+    order = [label for label in names + [f"shadow {n}" for n in names] if label in res]
     return " · ".join(f"{label} " + ", ".join(f"{k} {v}" for k, v in sorted(res[label].items())) for label in order)
 
 
@@ -131,7 +134,7 @@ def main():
         issues.append(f"disk free only {free_gb:.1f} GB")
 
     since = utcnow() - timedelta(hours=24)
-    alerts = s8_signals = runs = fails = live = s8_live = 0
+    alerts = s8_signals = s8_shadows = runs = fails = live = s8_live = 0
     cost = 0.0
     plans = []
     for p in iter_plan_paths():
@@ -141,7 +144,9 @@ def main():
         run = pl.get("run", {})
         is_s8 = step8_test.is_step8(pl)
         if created and created >= since:
-            if is_s8:
+            if is_s8 and step8_test.is_shadow(pl):
+                s8_shadows += 1
+            elif is_s8:
                 s8_signals += 1
             else:
                 alerts += 1
@@ -161,7 +166,7 @@ def main():
     msg = (f"{head} · {fmt_utc(utcnow())} UTC\n"
            f"worker {worker_state}, polled {ago(tick_m)} · resolver ran {ago(res_m)} · "
            f"scanner wrote {ago(scan_m)}\n"
-           f"last 24h: Step-8 signals {s8_signals}, MTF alerts {alerts}{runs_txt}{watch_txt}\n"
+           f"last 24h: Step-8 signals {s8_signals} (shadow {s8_shadows}), MTF alerts {alerts}{runs_txt}{watch_txt}\n"
            f"resolved 24h: {res_txt}\n"
            f"live plans: {live} (Step-8 {s8_live}) · disk free {free_gb:.0f} GB\n"
            f"{acct_txt}")
