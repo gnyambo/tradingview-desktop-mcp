@@ -6,7 +6,9 @@ and scores the forward test (scanner @ market, fresh alerts only, vs the wide-st
 Also scores the Step-8 forward test (step8_test.py): the scanner's ACTIONABLE signals with three stop
 rules side by side.
 Usage: python3 report.py [--since YYYY-MM-DD] [--forward-from "YYYY-MM-DD HH:MM"] [--brief]
-       --brief prints only the forward-test sections (quick status).
+       --brief prints only the tests that are running (quick status, used by tvstatus): an empty
+       group is one line, and the closed rule-wide test 1 and the uncounted trades between the two
+       rule-wide tests are left out. The full report still shows them.
 """
 import argparse
 import math
@@ -217,9 +219,11 @@ class Bucket:
                 f"avg {avg:>7} | total {tot:>7} | {usd:>18} | risk/trade {risk:>4} | not entered: {ne}")
 
 
-def step8_lines(plans: list[dict], start: str = step8_test.FROM, shadow: bool = False) -> list[str]:
+def step8_lines(plans: list[dict], start: str = step8_test.FROM, shadow: bool = False,
+                brief: bool = False) -> list[str]:
     """Step-8 forward test: one Bucket per stop rule on the same signals, verdict per rule.
-    shadow=True: the information-only group of setups rejected only by volume and/or RR (no verdict)."""
+    shadow=True: the information-only group of setups rejected only by volume and/or RR (no verdict).
+    brief=True: the empty shadow group is a single line instead of a table of dashes."""
     buckets = {leg: Bucket() for leg in step8_test.LEGS}
     longs = {leg: 0 for leg in step8_test.LEGS}
     signals = via_watch = repeats = 0
@@ -249,6 +253,8 @@ def step8_lines(plans: list[dict], start: str = step8_test.FROM, shadow: bool = 
     else:
         out = [f"== STEP-8 FORWARD TEST from {start} UTC: scanner ACTIONABLE signals, 3 stop rules, same signals ==",
                f"signals {signals} (found by the zone watch: {via_watch}; repeats left out: {repeats})"]
+    if brief and shadow and not signals:
+        return [out[0], f"setups 0 so far (repeats left out: {repeats})"]
     for leg in step8_test.LEGS:
         out.append(buckets[leg].line(step8_test.LABELS[leg]))
     for leg in step8_test.LEGS:
@@ -260,8 +266,9 @@ def step8_lines(plans: list[dict], start: str = step8_test.FROM, shadow: bool = 
     return out
 
 
-def rule_wide_lines(plans: list[dict]) -> list[str]:
-    """Rule wide @ market: test 1 frozen at its verdict, the uncounted trades between the tests, test 2."""
+def rule_wide_lines(plans: list[dict], brief: bool = False) -> list[str]:
+    """Rule wide @ market: test 1 frozen at its verdict, the uncounted trades between the tests, test 2.
+    brief=True: test 2 only (the one that is running)."""
     between, t2 = Bucket(), Bucket()
     t2_longs, t2_alerts, t2_intervals, t2_rows = 0, 0, [], []
     for pl in plans:
@@ -283,13 +290,17 @@ def rule_wide_lines(plans: list[dict]) -> list[str]:
     ordered = [r for _, r in sorted(t2_rows, key=lambda x: x[0]) if r is not None]  # the order trades resolved in
     m, se = mean_se(ordered)
     peak, clusters = exposure(t2_intervals)
-    out = ["== RULE WIDE @ market: Step-7 alert, market entry, 3x ATR stop, 1R target ==",
-           f"Test 1 (2026-10-26 to 2026-11-09): {TEST1_RESULT}",
-           between.line("between tests") + "  <- not counted in either test",
-           f"Test 2 from {TEST2_FROM} UTC (registered before its trades): pass = first {TEST2_N} resolved trades "
-           f">= {FORWARD_MIN_R:+.2f}R after fees, >= {TEST2_MIN_LONGS} longs",
-           f"alerts {t2_alerts} (repeats of a move already counted left out)",
-           t2.line("rule wide, test 2")]
+    pass_mark = f"first {TEST2_N} resolved trades >= {FORWARD_MIN_R:+.2f}R after fees, >= {TEST2_MIN_LONGS} longs"
+    if brief:
+        out = [f"== RULE WIDE TEST 2 from {TEST2_FROM} UTC: Step-7 alert, market entry, 3x ATR stop, 1R target ==",
+               f"pass = {pass_mark}"]
+    else:
+        out = ["== RULE WIDE @ market: Step-7 alert, market entry, 3x ATR stop, 1R target ==",
+               f"Test 1 (2026-10-26 to 2026-11-09): {TEST1_RESULT}",
+               between.line("between tests") + "  <- not counted in either test",
+               f"Test 2 from {TEST2_FROM} UTC (registered before its trades): pass = {pass_mark}"]
+    out += [f"alerts {t2_alerts} (repeats of a move already counted left out)",
+            t2.line("rule wide, test 2")]
     if m is not None:
         out.append(f"after fees: {m:+.3f}R" + (f" ± {se:.2f}" if se is not None else "") +
                    f" per trade | longs resolved {t2_longs} | up to {peak} same-direction positions open at once, "
@@ -383,9 +394,9 @@ def main():
     if a.brief:
         print("\n".join(step8_lines(s8_plans)))
         print()
-        print("\n".join(step8_lines(s8_plans, shadow=True)))
+        print("\n".join(step8_lines(s8_plans, shadow=True, brief=True)))
         print()
-        print("\n".join(rule_wide_lines(plans)))
+        print("\n".join(rule_wide_lines(plans, brief=True)))
         return
 
     print(f"Alerts: {len(plans)}  | /tv failed: {failed} | skipped by cap: {capped} | "

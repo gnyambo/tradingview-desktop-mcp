@@ -269,6 +269,25 @@ class RuleWideTests(unittest.TestCase):
         self.assertRegex(text, r"rule wide, test 2\s+plans\s+2 .*TP1\s+1 SL\s+1")
         self.assertIn("VERDICT (rule wide, test 2): not yet - 2/60 resolved trades, 1/10 longs", text)
 
+    def test_brief_shows_only_the_running_test(self):
+        plans = [wide_plan("2026-11-01 10:00", "TP1", 1.0), wide_plan("2026-11-10 10:00", "TP1", 1.0),
+                 wide_plan("2026-11-14 12:00", "LOSS", -1.0)]
+        text = "\n".join(report.rule_wide_lines(plans, brief=True))
+        self.assertNotIn("Test 1", text)
+        self.assertNotIn("between tests", text)
+        self.assertIn("== RULE WIDE TEST 2 from 2026-11-14 10:00 UTC", text)
+        self.assertIn("pass = first 60 resolved trades >= +0.10R after fees, >= 10 longs", text)
+        self.assertRegex(text, r"rule wide, test 2\s+plans\s+1 .*SL\s+1")
+        self.assertIn("VERDICT (rule wide, test 2): not yet - 1/60 resolved trades, 0/10 longs", text)
+
+    def test_brief_empty_shadow_group_is_one_line(self):
+        lines = report.step8_lines([], shadow=True, brief=True)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("SHADOW GROUP", lines[0])
+        self.assertEqual(lines[1], "setups 0 so far (repeats left out: 0)")
+        self.assertGreater(len(report.step8_lines([], shadow=True)), 2)      # the full report keeps its table
+        self.assertGreater(len(report.step8_lines([], brief=True)), 2)       # the real test always shows its verdicts
+
     def test_verdict_is_judged_on_the_first_n_only(self):
         early = [-1.0] * 6 + [1.0] * 4                 # first 10: -0.2R
         late = [1.0] * 30                               # a later winning run cannot rescue it
